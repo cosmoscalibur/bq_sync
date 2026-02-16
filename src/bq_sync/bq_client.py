@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
+from google.api_core import client_options as client_options_lib
 from google.cloud import bigquery
 from google.cloud import bigquery_datatransfer_v1 as datatransfer
 from google.cloud import dataform_v1beta1 as dataform
@@ -166,7 +167,8 @@ def list_scheduled_queries(project: str, region: str) -> list[ScheduledQueryInfo
     Returns:
         List of ``ScheduledQueryInfo`` at project level.
     """
-    client = datatransfer.DataTransferServiceClient()
+    options = client_options_lib.ClientOptions(quota_project_id=project)
+    client = datatransfer.DataTransferServiceClient(client_options=options)
     parent = f"projects/{project}/locations/{region}"
     configs: list[ScheduledQueryInfo] = []
 
@@ -210,34 +212,42 @@ def list_saved_queries(project: str, region: str) -> list[SavedQueryInfo]:
         "Results may be incomplete or change without notice."
     )
     try:
-        client = dataform.DataformClient()
+        options = client_options_lib.ClientOptions(quota_project_id=project)
+        client = dataform.DataformClient(client_options=options)
         parent = f"projects/{project}/locations/{region}"
         saved: list[SavedQueryInfo] = []
 
         for repo in client.list_repositories(parent=parent):
-            workspace_parent = f"{repo.name}/workspaces"
-            for ws in client.list_workspaces(parent=workspace_parent):
-                resp = client.query_directory_contents(
-                    workspace=ws.name,
+            if not repo.display_name:
+                continue
+            # Each saved query repo has one workspace with content.sql.
+            try:
+                ws_iter = client.list_workspaces(parent=repo.name)
+                ws = next(iter(ws_iter), None)
+            except Exception:
+                logger.debug("Cannot list workspaces for repo '%s'.", repo.display_name)
+                continue
+            if ws is None:
+                continue
+            try:
+                file_resp = client.read_file(
+                    request={"workspace": ws.name, "path": "content.sql"},
                 )
-                for entry in resp:
-                    if not entry.file or not entry.file.path.endswith(".sql"):
-                        continue
-                    file_resp = client.read_file(
-                        workspace=ws.name,
-                        path=entry.file.path,
-                    )
-                    saved.append(
-                        SavedQueryInfo(
-                            name=entry.file.path.rsplit("/", 1)[-1].removesuffix(
-                                ".sql"
-                            ),
-                            sql=file_resp.file_contents.decode()
-                            if isinstance(file_resp.file_contents, bytes)
-                            else file_resp.file_contents,
-                            modified=_EPOCH,
-                        )
-                    )
+            except Exception:
+                logger.debug("Cannot read content.sql in repo '%s'.", repo.display_name)
+                continue
+            sql = (
+                file_resp.file_contents.decode()
+                if isinstance(file_resp.file_contents, bytes)
+                else file_resp.file_contents
+            )
+            saved.append(
+                SavedQueryInfo(
+                    name=repo.display_name,
+                    sql=sql,
+                    modified=_EPOCH,
+                )
+            )
         return saved
     except Exception:
         logger.warning(
