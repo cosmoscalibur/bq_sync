@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bq-sync"
-version = "0.1.0"
+version = "0.1.1"
 description = "Sync BigQuery resources to a local directory structure."
 readme = "README.md"
 requires-python = ">=3.13"
