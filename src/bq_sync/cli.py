@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from pathlib import Path
 
-from bq_sync.config import discover_config, load_config
+from bq_sync.config import SyncConfig, discover_config, load_config
 from bq_sync.pull import pull_project
 
 
@@ -66,6 +67,38 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Deploy local resources to BigQuery (not yet implemented).",
     )
 
+    # --- fetch ---
+    fetch_parser = subparsers.add_parser(
+        "fetch",
+        help="Download table/view data as CSV or Parquet.",
+    )
+    fetch_parser.add_argument(
+        "model",
+        type=str,
+        help="BigQuery resource path: <project>/<dataset>/<model>.",
+    )
+    fetch_parser.add_argument(
+        "-f",
+        "--format",
+        type=str,
+        choices=["csv", "parquet"],
+        default="csv",
+        help="Output format (default: csv).",
+    )
+    fetch_parser.add_argument(
+        "-o",
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Directory where a 'data/' folder is created (default: config data dir).",
+    )
+    fetch_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to bq_sync.toml (default: auto-discover from CWD).",
+    )
+
     return parser
 
 
@@ -92,12 +125,19 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "pull":
         _handle_pull(args)
 
+    if args.command == "fetch":
+        _handle_fetch(args)
 
-def _handle_pull(args: argparse.Namespace) -> None:
-    """Handle the ``pull`` subcommand."""
-    from pathlib import Path
 
-    # Discover or use explicit config path.
+def _resolve_config(args: argparse.Namespace) -> tuple[Path, SyncConfig]:
+    """Discover and load config from CLI args.
+
+    Args:
+        args: Parsed CLI namespace (must have a ``config`` attribute).
+
+    Returns:
+        Tuple of (config_path, SyncConfig).
+    """
     if args.config:
         config_path = Path(args.config).resolve()
     else:
@@ -107,11 +147,15 @@ def _handle_pull(args: argparse.Namespace) -> None:
             logging.error("%s", exc)
             sys.exit(1)
 
-    config = load_config(config_path)
+    return config_path, load_config(config_path)
+
+
+def _handle_pull(args: argparse.Namespace) -> None:
+    """Handle the ``pull`` subcommand."""
+    config_path, config = _resolve_config(args)
 
     # If --dataset narrows the scope, override config.
     if args.dataset:
-        # Replace datasets list with the single requested dataset.
         config = config.__class__(
             project=config.project,
             datasets=[args.dataset],
@@ -125,3 +169,44 @@ def _handle_pull(args: argparse.Namespace) -> None:
         force=args.force,
         force_files=args.force_file,
     )
+
+
+def _handle_fetch(args: argparse.Namespace) -> None:
+    """Handle the ``fetch`` subcommand."""
+    from bq_sync import bq_client
+    from bq_sync.config import resolve_output_dir
+
+    parts = args.model.split("/")
+    if len(parts) == 4:
+        # Local path: <project>/<dataset>/<resource_type>/<name[.ext]>
+        project, dataset, _, name = parts
+    elif len(parts) == 3:
+        # BQ path: <project>/<dataset>/<name[.ext]>
+        project, dataset, name = parts
+    else:
+        logging.error(
+            "Invalid model path '%s': expected "
+            "<project>/<dataset>/<table_or_view> or "
+            "<project>/<dataset>/<resource_type>/<table_or_view> "
+            "but got %d segments.",
+            args.model,
+            len(parts),
+        )
+        sys.exit(1)
+
+    # Strip file extension if present (e.g. ".yaml", ".sql").
+    model = Path(name).stem
+    fmt: str = args.format
+
+    # Resolve output directory.
+    if args.output_dir:
+        data_dir = Path(args.output_dir).resolve() / "data"
+    else:
+        config_path, config = _resolve_config(args)
+        data_dir = resolve_output_dir(config, config_path) / "data"
+
+    dest = data_dir / f"{model}.{fmt}"
+
+    logging.info("Fetching %s -> %s", args.model, dest)
+    bq_client.fetch_table_to_file(project, dataset, model, dest, fmt=fmt)
+    logging.info("Saved %s", dest)

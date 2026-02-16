@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 
 from google.api_core import client_options as client_options_lib
 from google.cloud import bigquery
@@ -257,3 +258,50 @@ def list_saved_queries(project: str, region: str) -> list[SavedQueryInfo]:
             exc_info=True,
         )
         return []
+
+
+def fetch_table_to_file(
+    project: str,
+    dataset: str,
+    table: str,
+    dest: Path,
+    fmt: str = "csv",
+) -> None:
+    """Fetch all rows from a BigQuery table or view and write to a local file.
+
+    Uses ``list_rows`` to stream data and Polars for efficient serialisation
+    to CSV or Parquet.
+
+    Args:
+        project: GCP project ID.
+        dataset: BigQuery dataset ID.
+        table: Table or view name.
+        dest: Target file path (parent directories are created automatically).
+        fmt: Output format, ``"csv"`` or ``"parquet"``.
+
+    Raises:
+        ValueError: If *fmt* is not ``"csv"`` or ``"parquet"``.
+    """
+    import polars as pl
+
+    if fmt not in ("csv", "parquet"):
+        msg = f"Unsupported format: {fmt!r}. Expected 'csv' or 'parquet'."
+        raise ValueError(msg)
+
+    client = bigquery.Client(project=project)
+    table_ref = f"{project}.{dataset}.{table}"
+    rows_iter = client.list_rows(table_ref)
+
+    columns: list[str] = [field.name for field in rows_iter.schema]
+    data: dict[str, list[object]] = {col: [] for col in columns}
+    for row in rows_iter:
+        for col in columns:
+            data[col].append(row[col])
+
+    df = pl.DataFrame(data)
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if fmt == "csv":
+        df.write_csv(dest)
+    else:
+        df.write_parquet(dest)

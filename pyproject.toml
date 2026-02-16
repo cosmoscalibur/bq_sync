@@ -13,6 +13,7 @@ dependencies = [
     "google-cloud-bigquery",
     "google-cloud-bigquery-datatransfer",
     "google-cloud-dataform",
+    "polars",
 ]
 
 [project.scripts]
