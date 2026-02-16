@@ -1,0 +1,9 @@
+[project]
+id = "your-gcp-project-id"
+default_region = "us-east1"
+
+[sync]
+datasets = ["dataset_name"]
+# Output root directory, relative to this config file.
+# Synced files are placed under <output_dir>/<project_id>/.
+output_dir = "."
