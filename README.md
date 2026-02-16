@@ -4,6 +4,8 @@ Sync BigQuery resources to a local directory structure.
 
 ## Install
 
+Requires Python ≥ 3.13.
+
 ```zsh
 pip install .
 # or
@@ -29,7 +31,8 @@ uv pip install .
 ## CLI Usage
 
 ```
-bq-sync pull [--dataset DATASET] [--dry-run] [--config PATH] [--force] [--force-file FILE]
+bq-sync pull  [--dataset DATASET] [--dry-run] [--config PATH] [--force] [--force-file FILE]
+bq-sync fetch <project/dataset/model> [-f csv|parquet] [-o DIR] [--config PATH]
 bq-sync push  # Not yet implemented
 ```
 
@@ -43,6 +46,15 @@ bq-sync push  # Not yet implemented
 | `--force` | Force fetch all files, bypassing decision matrix |
 | `--force-file FILE` | Force fetch a specific file (repeatable) |
 | `-v`, `--verbose` | Enable DEBUG logging |
+
+### fetch options
+
+| Flag | Description |
+|---|---|
+| `model` (positional) | BigQuery resource path: `<project>/<dataset>/<model>` or `<project>/<dataset>/<resource_type>/<model>` |
+| `-f`, `--format` | Output format: `csv` (default) or `parquet` |
+| `-o`, `--output-dir` | Directory where a `data/` folder is created (default: config output dir) |
+| `--config` | Path to `bq_sync.toml` (default: auto-discover from CWD upward) |
 
 ## Configuration
 
@@ -66,6 +78,7 @@ output_dir = "."  # Relative to this config file
     │   ├── routines/
     │   ├── models/
     │   └── externals/
+    ├── data/
     ├── scheduled_queries/
     └── saved_queries/
 ```
