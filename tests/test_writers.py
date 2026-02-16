@@ -1,10 +1,11 @@
-"""Tests for ``bq_sync.writers``."""
+"""Tests for ``bq_sync.writers`` and ``bq_sync.humanize``."""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
 
+from bq_sync.humanize import humanize_bytes
 from bq_sync.resources import (
     ExternalTableInfo,
     RoutineInfo,
@@ -16,13 +17,48 @@ from bq_sync.resources import (
 from bq_sync.writers import (
     write_external_definition,
     write_model_yaml,
+    write_routine_model_yaml,
     write_routine_sql,
     write_saved_query_sql,
     write_scheduled_query_sql,
+    write_view_model_yaml,
     write_view_sql,
 )
 
 TS = datetime(2025, 1, 1, tzinfo=timezone.utc)
+TS_CREATED = datetime(2024, 6, 15, 12, 0, tzinfo=timezone.utc)
+
+
+class TestHumanizeBytes:
+    """Tests for ``humanize_bytes``."""
+
+    def test_none_returns_empty(self) -> None:
+        """None input returns empty string."""
+        assert humanize_bytes(None) == ""
+
+    def test_zero(self) -> None:
+        """Zero bytes."""
+        assert humanize_bytes(0) == "0 B"
+
+    def test_bytes(self) -> None:
+        """Small value under 1 KiB."""
+        assert humanize_bytes(512) == "512 B"
+
+    def test_kibibytes(self) -> None:
+        """Value in KiB range."""
+        assert humanize_bytes(1024) == "1.0 KiB"
+
+    def test_mebibytes(self) -> None:
+        """Value in MiB range."""
+        assert humanize_bytes(1024 * 1024) == "1.0 MiB"
+
+    def test_gibibytes(self) -> None:
+        """Value in GiB range."""
+        assert humanize_bytes(2 * 1024**3) == "2.0 GiB"
+
+    def test_negative(self) -> None:
+        """Negative value."""
+        assert humanize_bytes(-1) == "-1 B"
 
 
 class TestWriteViewSql:
@@ -35,6 +71,41 @@ class TestWriteViewSql:
         write_view_sql(path, view)
 
         assert path.read_text() == "SELECT 1"
+
+
+class TestWriteViewModelYaml:
+    """Tests for ``write_view_model_yaml``."""
+
+    def test_yaml_content(self, tmp_path: Path) -> None:
+        """View model YAML contains type, schema, description, timestamps."""
+        view = ViewInfo(
+            name="active_users",
+            sql="SELECT id FROM users",
+            modified=TS,
+            schema=[
+                {
+                    "name": "id",
+                    "type": "INTEGER",
+                    "mode": "REQUIRED",
+                    "description": "User ID",
+                },
+            ],
+            description="Active users view",
+            created=TS_CREATED,
+            region="us-east1",
+        )
+        path = tmp_path / "models" / "active_users.yaml"
+        write_view_model_yaml(path, view)
+
+        content = path.read_text()
+        assert "name: active_users" in content
+        assert "type: VIEW" in content
+        assert '"Active users view"' in content
+        assert "created: 2024-06-15" in content
+        assert "modified: 2025-01-01" in content
+        assert "region: us-east1" in content
+        assert "schema:" in content
+        assert 'description: "User ID"' in content
 
 
 class TestWriteRoutineSql:
@@ -76,18 +147,32 @@ class TestWriteModelYaml:
     """Tests for ``write_model_yaml``."""
 
     def test_schema_fields(self, tmp_path: Path) -> None:
-        """Model YAML contains schema, description, and partitioning."""
+        """Model YAML contains enriched metadata and field descriptions."""
         table = TableInfo(
             name="events",
             schema=[
-                {"name": "id", "type": "INTEGER", "mode": "REQUIRED"},
-                {"name": "ts", "type": "TIMESTAMP", "mode": "NULLABLE"},
+                {
+                    "name": "id",
+                    "type": "INTEGER",
+                    "mode": "REQUIRED",
+                    "description": "Event ID",
+                },
+                {
+                    "name": "ts",
+                    "type": "TIMESTAMP",
+                    "mode": "NULLABLE",
+                    "description": "",
+                },
             ],
             description="Event log",
             row_count=1000,
             modified=TS,
             partitioning="ts",
             clustering=["id"],
+            created=TS_CREATED,
+            region="US",
+            primary_keys=["id"],
+            total_logical_bytes=5 * 1024**3,
         )
         path = tmp_path / "models" / "events.yaml"
         write_model_yaml(path, table)
@@ -97,19 +182,40 @@ class TestWriteModelYaml:
         assert "partitioning: ts" in content
         assert "clustering: [id]" in content
         assert "schema:" in content
+        assert "created: 2024-06-15" in content
+        assert "modified: 2025-01-01" in content
+        assert "region: US" in content
+        assert "primary_keys: [id]" in content
+        assert "total_logical_bytes: 5.0 GiB" in content
+        assert 'description: "Event ID"' in content
+        # Empty description shows placeholder.
+        assert 'description: ""' in content
+        assert content.count("description:") == 3  # table-level + 2 fields
 
 
 class TestWriteExternalDefinition:
     """Tests for ``write_external_definition``."""
 
     def test_yaml_content(self, tmp_path: Path) -> None:
-        """External definition YAML has source_uris and schema."""
+        """External definition YAML has enriched metadata and schema."""
         ext = ExternalTableInfo(
             name="ext_table",
             source_uris=["gs://bucket/file.csv"],
-            schema=[{"name": "col", "type": "STRING", "mode": "NULLABLE"}],
+            schema=[
+                {
+                    "name": "col",
+                    "type": "STRING",
+                    "mode": "NULLABLE",
+                    "description": "A column",
+                },
+            ],
             source_format="CSV",
             modified=TS,
+            description="External feed",
+            created=TS_CREATED,
+            region="EU",
+            total_logical_bytes=2048,
+            row_count=50,
         )
         path = tmp_path / "externals" / "ext_table.yaml"
         write_external_definition(path, ext)
@@ -119,6 +225,47 @@ class TestWriteExternalDefinition:
         assert "source_format: CSV" in content
         assert "gs://bucket/file.csv" in content
         assert "schema:" in content
+        assert '"External feed"' in content
+        assert "created: 2024-06-15" in content
+        assert "modified: 2025-01-01" in content
+        assert "region: EU" in content
+        assert "row_count: 50" in content
+        assert "total_logical_bytes: 2.0 KiB" in content
+        assert 'description: "A column"' in content
+
+
+class TestWriteRoutineModelYaml:
+    """Tests for ``write_routine_model_yaml``."""
+
+    def test_yaml_content(self, tmp_path: Path) -> None:
+        """Routine model YAML contains language, timestamps, args, return type."""
+        routine = RoutineInfo(
+            name="add_numbers",
+            sql="RETURN x + y;",
+            language="SQL",
+            modified=TS,
+            description="Adds two numbers",
+            created=TS_CREATED,
+            arguments=[
+                {"name": "x", "type": "INT64", "mode": "IN"},
+                {"name": "y", "type": "INT64", "mode": "IN"},
+            ],
+            return_type="INT64",
+        )
+        path = tmp_path / "models" / "add_numbers.yaml"
+        write_routine_model_yaml(path, routine)
+
+        content = path.read_text()
+        assert "name: add_numbers" in content
+        assert '"Adds two numbers"' in content
+        assert "language: SQL" in content
+        assert "created: 2024-06-15" in content
+        assert "modified: 2025-01-01" in content
+        assert "return_type: INT64" in content
+        assert "arguments:" in content
+        assert "name: x" in content
+        assert "name: y" in content
+        assert "mode: IN" in content
 
 
 class TestWriteSavedQuerySql:

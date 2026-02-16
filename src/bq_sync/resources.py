@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 
@@ -13,6 +13,10 @@ class ViewInfo:
     name: str
     sql: str
     modified: datetime
+    schema: list[dict[str, str]] = field(default_factory=list)
+    description: str = ""
+    created: datetime | None = None
+    region: str | None = None
 
 
 @dataclass(frozen=True)
@@ -23,6 +27,10 @@ class RoutineInfo:
     sql: str
     language: str
     modified: datetime
+    description: str = ""
+    created: datetime | None = None
+    arguments: list[dict[str, str]] = field(default_factory=list)
+    return_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -36,6 +44,10 @@ class TableInfo:
     modified: datetime
     partitioning: str | None = None
     clustering: list[str] | None = None
+    created: datetime | None = None
+    region: str | None = None
+    primary_keys: list[str] | None = None
+    total_logical_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -47,6 +59,14 @@ class ExternalTableInfo:
     schema: list[dict[str, str]]
     source_format: str
     modified: datetime
+    description: str = ""
+    created: datetime | None = None
+    region: str | None = None
+    total_logical_bytes: int | None = None
+    row_count: int = 0
+    partitioning: str | None = None
+    clustering: list[str] | None = None
+    primary_keys: list[str] | None = None
 
 
 @dataclass(frozen=True)

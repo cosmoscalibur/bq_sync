@@ -46,11 +46,24 @@ def list_views(project: str, dataset: str) -> list[ViewInfo]:
         if table_item.table_type != "VIEW":
             continue
         table = client.get_table(table_item.reference)
+        schema = [
+            {
+                "name": f.name,
+                "type": f.field_type,
+                "mode": f.mode,
+                "description": f.description or "",
+            }
+            for f in table.schema
+        ]
         views.append(
             ViewInfo(
                 name=table.table_id,
                 sql=table.view_query or "",
                 modified=table.modified or _EPOCH,
+                schema=schema,
+                description=table.description or "",
+                created=table.created,
+                region=table.location,
             )
         )
     return views
@@ -72,12 +85,30 @@ def list_routines(project: str, dataset: str) -> list[RoutineInfo]:
 
     for routine_item in client.list_routines(dataset_ref):
         routine = client.get_routine(routine_item.reference)
+        args: list[dict[str, str]] = []
+        for arg in routine.arguments or []:
+            data_type = arg.data_type
+            type_str = data_type.type_kind.name if data_type else "ANY"
+            args.append(
+                {
+                    "name": arg.name or "",
+                    "type": type_str,
+                    "mode": arg.mode or "IN",
+                }
+            )
+        ret = None
+        if routine.return_type:
+            ret = routine.return_type.type_kind.name
         routines.append(
             RoutineInfo(
                 name=routine.routine_id,
                 sql=routine.body or "",
                 language=routine.language or "SQL",
                 modified=routine.modified or _EPOCH,
+                description=routine.description or "",
+                created=routine.created,
+                arguments=args,
+                return_type=ret,
             )
         )
     return routines
@@ -102,13 +133,24 @@ def list_tables(project: str, dataset: str) -> list[TableInfo]:
             continue
         table = client.get_table(table_item.reference)
         schema = [
-            {"name": f.name, "type": f.field_type, "mode": f.mode} for f in table.schema
+            {
+                "name": f.name,
+                "type": f.field_type,
+                "mode": f.mode,
+                "description": f.description or "",
+            }
+            for f in table.schema
         ]
         partitioning = None
         if table.time_partitioning:
             partitioning = table.time_partitioning.field or "ingestion_time"
 
         clustering = list(table.clustering_fields) if table.clustering_fields else None
+
+        pk_columns: list[str] | None = None
+        constraints = getattr(table, "table_constraints", None)
+        if constraints and getattr(constraints, "primary_key", None):
+            pk_columns = list(constraints.primary_key.columns)
 
         tables.append(
             TableInfo(
@@ -119,6 +161,10 @@ def list_tables(project: str, dataset: str) -> list[TableInfo]:
                 modified=table.modified or _EPOCH,
                 partitioning=partitioning,
                 clustering=clustering,
+                created=table.created,
+                region=table.location,
+                primary_keys=pk_columns,
+                total_logical_bytes=table.num_bytes,
             )
         )
     return tables
@@ -143,9 +189,27 @@ def list_external_tables(project: str, dataset: str) -> list[ExternalTableInfo]:
             continue
         table = client.get_table(table_item.reference)
         schema = [
-            {"name": f.name, "type": f.field_type, "mode": f.mode} for f in table.schema
+            {
+                "name": f.name,
+                "type": f.field_type,
+                "mode": f.mode,
+                "description": f.description or "",
+            }
+            for f in table.schema
         ]
         ext_config = table.external_data_configuration
+
+        partitioning = None
+        if table.time_partitioning:
+            partitioning = table.time_partitioning.field or "ingestion_time"
+
+        clustering = list(table.clustering_fields) if table.clustering_fields else None
+
+        pk_columns: list[str] | None = None
+        constraints = getattr(table, "table_constraints", None)
+        if constraints and getattr(constraints, "primary_key", None):
+            pk_columns = list(constraints.primary_key.columns)
+
         externals.append(
             ExternalTableInfo(
                 name=table.table_id,
@@ -153,6 +217,14 @@ def list_external_tables(project: str, dataset: str) -> list[ExternalTableInfo]:
                 schema=schema,
                 source_format=ext_config.source_format if ext_config else "",
                 modified=table.modified or _EPOCH,
+                description=table.description or "",
+                created=table.created,
+                region=table.location,
+                total_logical_bytes=table.num_bytes,
+                row_count=table.num_rows or 0,
+                partitioning=partitioning,
+                clustering=clustering,
+                primary_keys=pk_columns,
             )
         )
     return externals
