@@ -280,3 +280,142 @@ class TestWriteSavedQuerySql:
         content = path.read_text()
         assert "-- Saved Query: q1" in content
         assert "SELECT 2" in content
+
+
+class TestDescriptionPreservation:
+    """Tests that re-writing YAML preserves locally-edited descriptions."""
+
+    def test_model_preserves_model_description(self, tmp_path: Path) -> None:
+        """Existing non-empty model description is kept on rewrite."""
+        path = tmp_path / "models" / "events.yaml"
+        path.parent.mkdir(parents=True)
+        # Simulate a locally-edited file.
+        path.write_text(
+            'name: events\ndescription: "Local doc"\nschema:\n',
+            encoding="utf-8",
+        )
+        table = TableInfo(
+            name="events",
+            schema=[],
+            description="BQ doc",
+            row_count=0,
+            modified=TS,
+        )
+        write_model_yaml(path, table)
+
+        content = path.read_text()
+        assert '"Local doc"' in content
+        assert '"BQ doc"' not in content
+
+    def test_model_uses_bq_when_local_empty(self, tmp_path: Path) -> None:
+        """Empty local description falls back to BQ value."""
+        path = tmp_path / "models" / "events.yaml"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            'name: events\ndescription: ""\nschema:\n',
+            encoding="utf-8",
+        )
+        table = TableInfo(
+            name="events",
+            schema=[],
+            description="BQ doc",
+            row_count=0,
+            modified=TS,
+        )
+        write_model_yaml(path, table)
+
+        content = path.read_text()
+        assert '"BQ doc"' in content
+
+    def test_model_preserves_field_description(self, tmp_path: Path) -> None:
+        """Existing non-empty field descriptions are kept on rewrite."""
+        path = tmp_path / "models" / "events.yaml"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            'name: events\ndescription: ""\nschema:\n'
+            "  - name: id  type: INTEGER  mode: REQUIRED"
+            '  description: "Local field doc"\n',
+            encoding="utf-8",
+        )
+        table = TableInfo(
+            name="events",
+            schema=[
+                {
+                    "name": "id",
+                    "type": "INTEGER",
+                    "mode": "REQUIRED",
+                    "description": "BQ field doc",
+                },
+            ],
+            description="",
+            row_count=0,
+            modified=TS,
+        )
+        write_model_yaml(path, table)
+
+        content = path.read_text()
+        assert '"Local field doc"' in content
+        assert '"BQ field doc"' not in content
+
+    def test_view_preserves_description(self, tmp_path: Path) -> None:
+        """View model YAML preserves local description."""
+        path = tmp_path / "models" / "v.yaml"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            'name: v\ndescription: "Local view"\ntype: VIEW\nschema:\n',
+            encoding="utf-8",
+        )
+        view = ViewInfo(
+            name="v",
+            sql="SELECT 1",
+            modified=TS,
+            description="BQ view",
+        )
+        write_view_model_yaml(path, view)
+
+        content = path.read_text()
+        assert '"Local view"' in content
+        assert '"BQ view"' not in content
+
+    def test_routine_preserves_description(self, tmp_path: Path) -> None:
+        """Routine model YAML preserves local description."""
+        path = tmp_path / "models" / "fn.yaml"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            'name: fn\ndescription: "Local routine"\nlanguage: SQL\n',
+            encoding="utf-8",
+        )
+        routine = RoutineInfo(
+            name="fn",
+            sql="RETURN 1;",
+            language="SQL",
+            modified=TS,
+            description="BQ routine",
+        )
+        write_routine_model_yaml(path, routine)
+
+        content = path.read_text()
+        assert '"Local routine"' in content
+        assert '"BQ routine"' not in content
+
+    def test_external_preserves_description(self, tmp_path: Path) -> None:
+        """External table YAML preserves local description."""
+        path = tmp_path / "models" / "ext.yaml"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            'name: ext\ndescription: "Local ext"\nschema:\n',
+            encoding="utf-8",
+        )
+        ext = ExternalTableInfo(
+            name="ext",
+            source_uris=["gs://b/f.csv"],
+            schema=[],
+            source_format="CSV",
+            modified=TS,
+            description="BQ ext",
+        )
+        write_external_definition(path, ext)
+
+        content = path.read_text()
+        assert '"Local ext"' in content
+        assert '"BQ ext"' not in content

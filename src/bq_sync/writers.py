@@ -21,6 +21,116 @@ def _ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
+def _load_existing_descriptions(path: Path) -> tuple[str | None, dict[str, str]]:
+    """Extract descriptions from an existing YAML model file.
+
+    Parses the top-level ``description:`` value and per-field
+    ``description:`` values inside the ``schema:`` block using
+    line-by-line text matching (no external YAML dependency).
+
+    Args:
+        path: Path to an existing YAML file.
+
+    Returns:
+        Tuple of (model_description, {field_name: field_description}).
+        ``model_description`` is ``None`` when file does not exist or
+        the key is absent.  Field descriptions are only collected for
+        fields whose ``description`` is non-empty.
+    """
+    if not path.is_file():
+        return None, {}
+
+    text = path.read_text(encoding="utf-8")
+
+    # --- top-level description ---
+    model_desc: str | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("description:"):
+            raw = stripped[len("description:") :].strip()
+            # Value is JSON-encoded (e.g. "My desc" or "").
+            try:
+                model_desc = json.loads(raw) if raw else None
+            except (json.JSONDecodeError, ValueError):
+                model_desc = raw
+            break
+
+    # --- per-field descriptions ---
+    field_descs: dict[str, str] = {}
+    in_schema = False
+    current_field: str | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == "schema:":
+            in_schema = True
+            continue
+        if not in_schema:
+            continue
+        # End of schema block: a top-level key without leading spaces.
+        if not line.startswith(" ") and stripped and not stripped.startswith("-"):
+            break
+
+        if "name:" in stripped and stripped.startswith("- name:"):
+            # Field entry: "- name: foo  type: …  description: …"
+            parts = stripped.split("  ")
+            current_field = None
+            field_desc_val = ""
+            for part in parts:
+                part = part.strip().lstrip("- ")
+                if part.startswith("name:"):
+                    current_field = part[len("name:") :].strip()
+                elif part.startswith("description:"):
+                    raw = part[len("description:") :].strip()
+                    try:
+                        field_desc_val = json.loads(raw) if raw else ""
+                    except (json.JSONDecodeError, ValueError):
+                        field_desc_val = raw
+            if current_field and field_desc_val:
+                field_descs[current_field] = field_desc_val
+
+    return model_desc, field_descs
+
+
+def _merge_description(
+    bq_desc: str,
+    local_desc: str | None,
+) -> str:
+    """Return the description to write, preferring local over BQ.
+
+    Args:
+        bq_desc: Description fetched from BigQuery.
+        local_desc: Description found in the existing local file.
+
+    Returns:
+        The local description when non-empty, otherwise the BQ value.
+    """
+    if local_desc:
+        return local_desc
+    return bq_desc
+
+
+def _merge_field_descriptions(
+    schema: list[dict[str, str]],
+    local_fields: dict[str, str],
+) -> list[dict[str, str]]:
+    """Return schema with locally-edited field descriptions preserved.
+
+    Args:
+        schema: Field list from BigQuery.
+        local_fields: Mapping of field name → local description.
+
+    Returns:
+        New schema list with merged descriptions.
+    """
+    merged = []
+    for field in schema:
+        name = field["name"]
+        if name in local_fields:
+            field = {**field, "description": local_fields[name]}
+        merged.append(field)
+    return merged
+
+
 def write_view_sql(path: Path, view: ViewInfo) -> None:
     """Write a view SQL definition to *path*.
 
@@ -92,9 +202,12 @@ def write_model_yaml(path: Path, table: TableInfo) -> None:
         table: Table resource to write.
     """
     _ensure_parent(path)
+    local_desc, local_fields = _load_existing_descriptions(path)
+    desc = _merge_description(table.description, local_desc)
+    schema = _merge_field_descriptions(table.schema, local_fields)
     lines = [
         f"name: {table.name}",
-        f"description: {json.dumps(table.description)}",
+        f"description: {json.dumps(desc)}",
         f"row_count: {table.row_count}",
     ]
     if table.created:
@@ -115,7 +228,7 @@ def write_model_yaml(path: Path, table: TableInfo) -> None:
             f"total_logical_bytes: {humanize_bytes(table.total_logical_bytes)}"
         )
 
-    lines.extend(_format_schema_lines(table.schema))
+    lines.extend(_format_schema_lines(schema))
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -131,9 +244,12 @@ def write_view_model_yaml(path: Path, view: ViewInfo) -> None:
         view: View resource to write.
     """
     _ensure_parent(path)
+    local_desc, local_fields = _load_existing_descriptions(path)
+    desc = _merge_description(view.description, local_desc)
+    schema = _merge_field_descriptions(view.schema, local_fields)
     lines = [
         f"name: {view.name}",
-        f"description: {json.dumps(view.description)}",
+        f"description: {json.dumps(desc)}",
         "type: VIEW",
     ]
     if view.created:
@@ -142,7 +258,7 @@ def write_view_model_yaml(path: Path, view: ViewInfo) -> None:
     if view.region:
         lines.append(f"region: {view.region}")
 
-    lines.extend(_format_schema_lines(view.schema))
+    lines.extend(_format_schema_lines(schema))
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -157,9 +273,11 @@ def write_routine_model_yaml(path: Path, routine: RoutineInfo) -> None:
         routine: Routine resource to write.
     """
     _ensure_parent(path)
+    local_desc, _ = _load_existing_descriptions(path)
+    desc = _merge_description(routine.description, local_desc)
     lines = [
         f"name: {routine.name}",
-        f"description: {json.dumps(routine.description)}",
+        f"description: {json.dumps(desc)}",
         f"language: {routine.language}",
     ]
     if routine.created:
@@ -188,9 +306,12 @@ def write_external_definition(path: Path, ext: ExternalTableInfo) -> None:
         ext: External table resource to write.
     """
     _ensure_parent(path)
+    local_desc, local_fields = _load_existing_descriptions(path)
+    desc = _merge_description(ext.description, local_desc)
+    schema = _merge_field_descriptions(ext.schema, local_fields)
     lines = [
         f"name: {ext.name}",
-        f"description: {json.dumps(ext.description)}",
+        f"description: {json.dumps(desc)}",
         f"source_format: {ext.source_format}",
         "source_uris:",
     ]
@@ -214,7 +335,7 @@ def write_external_definition(path: Path, ext: ExternalTableInfo) -> None:
     if ext.total_logical_bytes is not None:
         lines.append(f"total_logical_bytes: {humanize_bytes(ext.total_logical_bytes)}")
 
-    lines.extend(_format_schema_lines(ext.schema))
+    lines.extend(_format_schema_lines(schema))
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

@@ -377,3 +377,48 @@ def fetch_table_to_file(
         df.write_csv(dest)
     else:
         df.write_parquet(dest)
+
+
+def fetch_query_to_file(
+    project: str,
+    sql: str,
+    dest: Path,
+    fmt: str = "csv",
+) -> None:
+    """Execute a SQL query on BigQuery and write results to a local file.
+
+    Useful for saved queries and views whose data must be recovered by
+    running their SQL definition.
+
+    Args:
+        project: GCP project ID.
+        sql: SQL query string to execute.
+        dest: Target file path (parent directories are created automatically).
+        fmt: Output format, ``"csv"`` or ``"parquet"``.
+
+    Raises:
+        ValueError: If *fmt* is not ``"csv"`` or ``"parquet"``.
+    """
+    import polars as pl
+
+    if fmt not in ("csv", "parquet"):
+        msg = f"Unsupported format: {fmt!r}. Expected 'csv' or 'parquet'."
+        raise ValueError(msg)
+
+    client = bigquery.Client(project=project)
+    query_job = client.query(sql)
+    rows_iter = query_job.result()
+
+    columns: list[str] = [field.name for field in rows_iter.schema]
+    data: dict[str, list[object]] = {col: [] for col in columns}
+    for row in rows_iter:
+        for col in columns:
+            data[col].append(row[col])
+
+    df = pl.DataFrame(data)
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if fmt == "csv":
+        df.write_csv(dest)
+    else:
+        df.write_parquet(dest)

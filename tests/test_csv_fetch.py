@@ -179,3 +179,114 @@ class TestFetchTableToFile:
 
         assert dest.stem == "my_table"
         assert dest.suffix == ".csv"
+
+
+# ---------------------------------------------------------------------------
+# CLI: --output-dir used as-is
+# ---------------------------------------------------------------------------
+
+
+class TestFetchOutputDirAsIs:
+    """Verify ``--output-dir`` is used without appending ``data/``."""
+
+    def test_output_dir_no_extra_data(self) -> None:
+        """``--output-dir /tmp/out`` should not append extra ``data/``."""
+        parser = _build_parser()
+        args = parser.parse_args(["fetch", "proj/ds/tbl", "-o", "/tmp/out"])
+
+        assert args.output_dir == "/tmp/out"
+
+    def test_output_dir_ending_with_data(self) -> None:
+        """``--output-dir /tmp/data`` is accepted as-is."""
+        parser = _build_parser()
+        args = parser.parse_args(["fetch", "proj/ds/tbl", "-o", "/tmp/data"])
+
+        assert args.output_dir == "/tmp/data"
+
+
+# ---------------------------------------------------------------------------
+# CLI: saved_queries path format
+# ---------------------------------------------------------------------------
+
+
+class TestSavedQueryPathParsing:
+    """Verify ``<project>/saved_queries/<name>`` parsing."""
+
+    def test_saved_query_path_accepted(self) -> None:
+        """Three-segment path with ``saved_queries`` is accepted."""
+        parser = _build_parser()
+        args = parser.parse_args(["fetch", "proj/saved_queries/my_query"])
+
+        assert args.model == "proj/saved_queries/my_query"
+
+    def test_saved_query_with_extension(self) -> None:
+        """Saved query path with ``.sql`` extension is accepted."""
+        parser = _build_parser()
+        args = parser.parse_args(["fetch", "proj/saved_queries/my_query.sql"])
+
+        assert args.model == "proj/saved_queries/my_query.sql"
+
+
+# ---------------------------------------------------------------------------
+# fetch_query_to_file
+# ---------------------------------------------------------------------------
+
+
+class TestFetchQueryToFile:
+    """Tests for ``bq_client.fetch_query_to_file``."""
+
+    @patch("bq_sync.bq_client.bigquery.Client")
+    def test_csv_output(self, mock_client_cls: MagicMock, tmp_path: Path) -> None:
+        """CSV file is created from query results."""
+        columns = ["id", "val"]
+        data = [[1, "a"], [2, "b"]]
+
+        mock_result = MagicMock()
+        mock_result.schema = _make_mock_schema(columns)
+        mock_result.__iter__ = MagicMock(
+            return_value=iter(_make_mock_rows(columns, data))
+        )
+        mock_job = MagicMock()
+        mock_job.result.return_value = mock_result
+        mock_client_cls.return_value.query.return_value = mock_job
+
+        from bq_sync.bq_client import fetch_query_to_file
+
+        dest = tmp_path / "out" / "result.csv"
+        fetch_query_to_file("proj", "SELECT 1", dest, fmt="csv")
+
+        assert dest.exists()
+        df = pl.read_csv(dest)
+        assert df.columns == columns
+        assert df.shape == (2, 2)
+
+    @patch("bq_sync.bq_client.bigquery.Client")
+    def test_parquet_output(self, mock_client_cls: MagicMock, tmp_path: Path) -> None:
+        """Parquet file is created from query results."""
+        columns = ["x"]
+        data = [[10], [20]]
+
+        mock_result = MagicMock()
+        mock_result.schema = _make_mock_schema(columns)
+        mock_result.__iter__ = MagicMock(
+            return_value=iter(_make_mock_rows(columns, data))
+        )
+        mock_job = MagicMock()
+        mock_job.result.return_value = mock_result
+        mock_client_cls.return_value.query.return_value = mock_job
+
+        from bq_sync.bq_client import fetch_query_to_file
+
+        dest = tmp_path / "out" / "result.parquet"
+        fetch_query_to_file("proj", "SELECT 1", dest, fmt="parquet")
+
+        assert dest.exists()
+        df = pl.read_parquet(dest)
+        assert df.shape == (2, 1)
+
+    def test_unsupported_format_raises(self, tmp_path: Path) -> None:
+        """ValueError raised for unsupported format."""
+        from bq_sync.bq_client import fetch_query_to_file
+
+        with pytest.raises(ValueError, match="Unsupported format"):
+            fetch_query_to_file("proj", "SELECT 1", tmp_path / "f.json", fmt="json")

@@ -7,7 +7,7 @@ import logging
 import sys
 from pathlib import Path
 
-from bq_sync.config import SyncConfig, discover_config, load_config
+from bq_sync.config import SyncConfig, discover_config, load_config, resolve_output_dir
 from bq_sync.pull import pull_project
 
 
@@ -90,7 +90,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=str,
         default=None,
-        help="Directory where a 'data/' folder is created (default: config data dir).",
+        help="Directory for output files (used as-is; default: config data dir).",
     )
     fetch_parser.add_argument(
         "--config",
@@ -171,42 +171,124 @@ def _handle_pull(args: argparse.Namespace) -> None:
     )
 
 
-def _handle_fetch(args: argparse.Namespace) -> None:
-    """Handle the ``fetch`` subcommand."""
-    from bq_sync import bq_client
-    from bq_sync.config import resolve_output_dir
+def _resolve_fetch_data_dir(args: argparse.Namespace) -> Path:
+    """Resolve the data output directory for the ``fetch`` subcommand.
 
+    When ``--output-dir`` is given, the path is used as-is.
+    Otherwise the default ``<project>/data`` path is used via config.
+
+    Args:
+        args: Parsed CLI namespace.
+
+    Returns:
+        Absolute path to the data output directory.
+    """
+    if args.output_dir:
+        return Path(args.output_dir).resolve()
+    config_path, config = _resolve_config(args)
+    return resolve_output_dir(config, config_path) / "data"
+
+
+def _resolve_sql_file(args: argparse.Namespace, resource_type: str, name: str) -> Path:
+    """Build the expected local SQL file path from the pull output structure.
+
+    Args:
+        args: Parsed CLI namespace (used for config resolution).
+        resource_type: Resource subdirectory (``"views"``, ``"saved_queries"``).
+        name: Resource name (without extension).
+
+    Returns:
+        Absolute path where the SQL file is expected.
+    """
+    config_path, config = _resolve_config(args)
+    output_root = resolve_output_dir(config, config_path)
+    return output_root / resource_type / f"{name}.sql"
+
+
+def _handle_fetch(args: argparse.Namespace) -> None:
+    """Handle the ``fetch`` subcommand.
+
+    Resolution strategy:
+
+    - Path ending in ``.sql``: validate the local file exists.  If it
+      does, execute its SQL via ``fetch_query_to_file``.  If not, fall
+      back to resource-type resolution.
+    - Path **not** ending in ``.sql``: use resource-type resolution
+      directly (``list_rows`` for tables/views, Dataform for saved
+      queries).
+    """
+    from bq_sync import bq_client
+
+    fmt: str = args.format
+    data_dir = _resolve_fetch_data_dir(args)
     parts = args.model.split("/")
+    ends_with_sql = parts[-1].endswith(".sql")
+
+    # --- saved queries: <project>/saved_queries/<name>[.sql] ---
+    if len(parts) == 3 and parts[1] == "saved_queries":
+        project = parts[0]
+        name = Path(parts[2]).stem
+        dest = data_dir / f"{name}.{fmt}"
+
+        if ends_with_sql:
+            sql_path = _resolve_sql_file(args, "saved_queries", name)
+            if sql_path.is_file():
+                sql = sql_path.read_text(encoding="utf-8")
+                logging.info("Executing local SQL %s -> %s", sql_path, dest)
+                bq_client.fetch_query_to_file(project, sql, dest, fmt=fmt)
+                logging.info("Saved %s", dest)
+                return
+
+        # Resource-type resolution: Dataform API lookup.
+        config_path, config = _resolve_config(args)
+        region = config.project.default_region
+        saved_list = bq_client.list_saved_queries(project, region)
+        match = next((s for s in saved_list if s.name == name), None)
+        if match is None:
+            logging.error(
+                "Saved query '%s' not found in project '%s' region '%s'.",
+                name,
+                project,
+                region,
+            )
+            sys.exit(1)
+        logging.info("Executing saved query '%s' -> %s", name, dest)
+        bq_client.fetch_query_to_file(project, match.sql, dest, fmt=fmt)
+        logging.info("Saved %s", dest)
+        return
+
+    # --- tables/views: <project>/<dataset>[/<resource_type>]/<name> ---
     if len(parts) == 4:
-        # Local path: <project>/<dataset>/<resource_type>/<name[.ext]>
-        project, dataset, _, name = parts
+        project, dataset, resource_type, name = parts
     elif len(parts) == 3:
-        # BQ path: <project>/<dataset>/<name[.ext]>
         project, dataset, name = parts
+        resource_type = None
     else:
         logging.error(
             "Invalid model path '%s': expected "
-            "<project>/<dataset>/<table_or_view> or "
-            "<project>/<dataset>/<resource_type>/<table_or_view> "
+            "<project>/<dataset>/<table_or_view>, "
+            "<project>/<dataset>/<resource_type>/<table_or_view>, or "
+            "<project>/saved_queries/<name> "
             "but got %d segments.",
             args.model,
             len(parts),
         )
         sys.exit(1)
 
-    # Strip file extension if present (e.g. ".yaml", ".sql").
     model = Path(name).stem
-    fmt: str = args.format
-
-    # Resolve output directory.
-    if args.output_dir:
-        data_dir = Path(args.output_dir).resolve() / "data"
-    else:
-        config_path, config = _resolve_config(args)
-        data_dir = resolve_output_dir(config, config_path) / "data"
-
     dest = data_dir / f"{model}.{fmt}"
 
+    # .sql extension triggers local file resolution.
+    if ends_with_sql and resource_type:
+        sql_path = _resolve_sql_file(args, f"{dataset}/{resource_type}", model)
+        if sql_path.is_file():
+            sql = sql_path.read_text(encoding="utf-8")
+            logging.info("Executing local SQL %s -> %s", sql_path, dest)
+            bq_client.fetch_query_to_file(project, sql, dest, fmt=fmt)
+            logging.info("Saved %s", dest)
+            return
+
+    # Resource-type resolution: BQ list_rows.
     logging.info("Fetching %s -> %s", args.model, dest)
     bq_client.fetch_table_to_file(project, dataset, model, dest, fmt=fmt)
     logging.info("Saved %s", dest)
