@@ -61,10 +61,53 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Force fetch a specific file (repeatable).",
     )
 
-    # --- push (placeholder) ---
-    subparsers.add_parser(
+    # --- push ---
+    push_parser = subparsers.add_parser(
         "push",
-        help="Deploy local resources to BigQuery (not yet implemented).",
+        help="Deploy local resources to BigQuery.",
+    )
+    push_parser.add_argument(
+        "--path",
+        type=str,
+        action="append",
+        default=None,
+        help="Manual mode: push a specific file (repeatable).",
+    )
+    push_parser.add_argument(
+        "--data",
+        nargs=2,
+        metavar=("SOURCE", "DEST"),
+        default=None,
+        help=(
+            "Table-replace: local CSV/Parquet path and "
+            "project/dataset/table destination (manual only)."
+        ),
+    )
+    push_parser.add_argument(
+        "--since",
+        type=float,
+        default=24.0,
+        help=(
+            "Auto mode fallback: hours to look back for modified files "
+            "when git is unavailable (default: 24)."
+        ),
+    )
+    push_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview changeset without executing writes.",
+    )
+    push_parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Skip interactive confirmation prompt.",
+    )
+    push_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to bq_sync.toml (default: auto-discover from CWD).",
     )
 
     # --- fetch ---
@@ -99,6 +142,34 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to bq_sync.toml (default: auto-discover from CWD).",
     )
 
+    # --- rm ---
+    rm_parser = subparsers.add_parser(
+        "rm",
+        help="Delete BQ resources and their local files.",
+    )
+    rm_parser.add_argument(
+        "path",
+        nargs="+",
+        help="Local file paths identifying BQ resources to delete.",
+    )
+    rm_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview without deleting.",
+    )
+    rm_parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Skip interactive confirmation.",
+    )
+    rm_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to bq_sync.toml (default: auto-discover from CWD).",
+    )
+
     return parser
 
 
@@ -118,15 +189,16 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     if args.command == "push":
-        from bq_sync.push import push_project
-
-        push_project()
+        _handle_push(args)
 
     if args.command == "pull":
         _handle_pull(args)
 
     if args.command == "fetch":
         _handle_fetch(args)
+
+    if args.command == "rm":
+        _handle_rm(args)
 
 
 def _resolve_config(args: argparse.Namespace) -> tuple[Path, SyncConfig]:
@@ -168,6 +240,68 @@ def _handle_pull(args: argparse.Namespace) -> None:
         dry_run=args.dry_run,
         force=args.force,
         force_files=args.force_file,
+    )
+
+
+def _handle_push(args: argparse.Namespace) -> None:
+    """Handle the ``push`` subcommand."""
+    from bq_sync.push import DataSpec, push_auto, push_manual
+
+    config_path, config = _resolve_config(args)
+
+    # Build DataSpec from --data if provided.
+    data_spec: DataSpec | None = None
+    if args.data:
+        source_str, dest_str = args.data
+        dest_parts = dest_str.split("/")
+        if len(dest_parts) != 3:
+            logging.error(
+                "Invalid --data destination '%s': expected project/dataset/table.",
+                dest_str,
+            )
+            sys.exit(1)
+        source_path = Path(source_str).resolve()
+        fmt = "parquet" if source_path.suffix == ".parquet" else "csv"
+        data_spec = DataSpec(
+            source=source_path,
+            project=dest_parts[0],
+            dataset=dest_parts[1],
+            table=dest_parts[2],
+            fmt=fmt,
+        )
+
+    is_manual = args.path or args.data
+
+    if is_manual:
+        push_manual(
+            config,
+            config_path,
+            paths=args.path or [],
+            dry_run=args.dry_run,
+            yes=args.yes,
+            data_spec=data_spec,
+        )
+    else:
+        push_auto(
+            config,
+            config_path,
+            dry_run=args.dry_run,
+            yes=args.yes,
+            since_hours=args.since,
+        )
+
+
+def _handle_rm(args: argparse.Namespace) -> None:
+    """Handle the ``rm`` subcommand."""
+    from bq_sync.push import rm_resources
+
+    config_path, config = _resolve_config(args)
+    rm_resources(
+        config,
+        config_path,
+        paths=args.path,
+        dry_run=args.dry_run,
+        yes=args.yes,
     )
 
 

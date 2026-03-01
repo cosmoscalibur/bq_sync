@@ -33,7 +33,8 @@ uv pip install .
 ```
 bq-sync pull  [--dataset DATASET] [--dry-run] [--config PATH] [--force] [--force-file FILE]
 bq-sync fetch <project/dataset/model> [-f csv|parquet] [-o DIR] [--config PATH]
-bq-sync push  # Not yet implemented
+bq-sync push  [--path FILE]... [--data SOURCE DEST] [--since HOURS] [--dry-run] [--yes] [--config PATH]
+bq-sync rm    <path>... [--dry-run] [--yes] [--config PATH]
 ```
 
 ### pull options
@@ -54,6 +55,35 @@ bq-sync push  # Not yet implemented
 | `model` (positional) | BigQuery resource path: `<project>/<dataset>/<model>` or `<project>/<dataset>/<resource_type>/<model>` |
 | `-f`, `--format` | Output format: `csv` (default) or `parquet` |
 | `-o`, `--output-dir` | Directory where a `data/` folder is created (default: config output dir) |
+| `--config` | Path to `bq_sync.toml` (default: auto-discover from CWD upward) |
+
+### push options
+
+If neither `--path` nor `--data` is provided, **auto mode** is used: detect
+changed files via `git status` (preferred) or by file modification time
+(`--since`).  Both modes print the changeset and prompt for `y/N` confirmation.
+
+Pushable resources: views (SQL), routines (SQL/JS), models (YAML descriptions),
+and saved queries (SQL).
+
+| Flag | Description |
+|---|---|
+| `--path FILE` | Manual mode: push a specific file (repeatable) |
+| `--data SOURCE DEST` | Table-replace: local CSV/Parquet path + `project/dataset/table` (manual only) |
+| `--since HOURS` | Fallback look-back window when git is unavailable (default: 24) |
+| `--dry-run` | Preview changeset without writing to BQ |
+| `-y`, `--yes` | Skip interactive confirmation |
+| `--config` | Path to `bq_sync.toml` (default: auto-discover from CWD upward) |
+
+### rm options
+
+Deletes the BQ resource first, then removes the local file on success.
+
+| Flag | Description |
+|---|---|
+| `path` (positional) | Local file paths identifying BQ resources to delete (repeatable) |
+| `--dry-run` | Preview without deleting |
+| `-y`, `--yes` | Skip interactive confirmation |
 | `--config` | Path to `bq_sync.toml` (default: auto-discover from CWD upward) |
 
 ## Configuration

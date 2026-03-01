@@ -422,3 +422,270 @@ def fetch_query_to_file(
         df.write_csv(dest)
     else:
         df.write_parquet(dest)
+
+
+# ---------------------------------------------------------------------------
+# Write-side functions (push mode)
+# ---------------------------------------------------------------------------
+
+
+def update_view(project: str, dataset: str, name: str, sql: str) -> None:
+    """Update the SQL definition of an existing BigQuery view.
+
+    Args:
+        project: GCP project ID.
+        dataset: BigQuery dataset ID.
+        name: View name.
+        sql: New SQL query for the view.
+    """
+    client = bigquery.Client(project=project)
+    table_ref = f"{project}.{dataset}.{name}"
+    table = client.get_table(table_ref)
+    table.view_query = sql
+    client.update_table(table, ["view_query"])
+    logger.info("Updated view %s.%s.%s", project, dataset, name)
+
+
+def update_table_description(
+    project: str,
+    dataset: str,
+    name: str,
+    description: str,
+    field_descriptions: dict[str, str] | None = None,
+) -> None:
+    """Update the description of a table or view and its fields.
+
+    Only the ``description`` attribute of the table and the
+    ``description`` attribute of each schema field listed in
+    *field_descriptions* are modified.
+
+    Args:
+        project: GCP project ID.
+        dataset: BigQuery dataset ID.
+        name: Table or view name.
+        description: New top-level description.
+        field_descriptions: Mapping of field name to new description.
+            Fields not present in this mapping are left unchanged.
+    """
+    client = bigquery.Client(project=project)
+    table_ref = f"{project}.{dataset}.{name}"
+    table = client.get_table(table_ref)
+
+    table.description = description
+
+    fields_map = field_descriptions or {}
+    if fields_map:
+        new_schema = []
+        for sf in table.schema:
+            if sf.name in fields_map:
+                sf = sf._replace(description=fields_map[sf.name])
+            new_schema.append(sf)
+        table.schema = new_schema
+
+    update_fields = ["description"]
+    if fields_map:
+        update_fields.append("schema")
+    client.update_table(table, update_fields)
+    logger.info("Updated description for %s.%s.%s", project, dataset, name)
+
+
+def update_saved_query(
+    project: str,
+    region: str,
+    name: str,
+    sql: str,
+) -> None:
+    """Update the SQL content of a saved query via Dataform API.
+
+    Locates the repository matching *name*, finds its workspace, and
+    writes the new SQL to ``content.sql``.
+
+    Args:
+        project: GCP project ID.
+        region: GCP region (e.g. ``us-east1``).
+        name: Saved query display name.
+        sql: New SQL content.
+
+    Raises:
+        ValueError: If the saved query is not found.
+    """
+    options = client_options_lib.ClientOptions(quota_project_id=project)
+    client = dataform.DataformClient(client_options=options)
+    parent = f"projects/{project}/locations/{region}"
+
+    target_ws = None
+    for repo in client.list_repositories(parent=parent):
+        if repo.display_name == name:
+            ws_iter = client.list_workspaces(parent=repo.name)
+            target_ws = next(iter(ws_iter), None)
+            break
+
+    if target_ws is None:
+        msg = (
+            f"Saved query '{name}' not found in project '{project}' region '{region}'."
+        )
+        raise ValueError(msg)
+
+    client.write_file(
+        request={
+            "workspace": target_ws.name,
+            "path": "content.sql",
+            "contents": sql.encode(),
+        },
+    )
+    logger.info("Updated saved query '%s'", name)
+
+
+def load_table_from_file(
+    project: str,
+    dataset: str,
+    table: str,
+    source: Path,
+    fmt: str = "csv",
+) -> None:
+    """Replace a BigQuery table's contents with data from a local file.
+
+    Uses ``WRITE_TRUNCATE`` to fully replace the table data.
+
+    Args:
+        project: GCP project ID.
+        dataset: BigQuery dataset ID.
+        table: Target table name.
+        source: Local CSV or Parquet file.
+        fmt: Source format, ``"csv"`` or ``"parquet"``.
+
+    Raises:
+        ValueError: If *fmt* is not ``"csv"`` or ``"parquet"``.
+        FileNotFoundError: If *source* does not exist.
+    """
+    if fmt not in ("csv", "parquet"):
+        msg = f"Unsupported format: {fmt!r}. Expected 'csv' or 'parquet'."
+        raise ValueError(msg)
+
+    if not source.is_file():
+        msg = f"Source file not found: {source}"
+        raise FileNotFoundError(msg)
+
+    client = bigquery.Client(project=project)
+    table_ref = f"{project}.{dataset}.{table}"
+
+    source_format = (
+        bigquery.SourceFormat.CSV if fmt == "csv" else bigquery.SourceFormat.PARQUET
+    )
+    job_config = bigquery.LoadJobConfig(
+        source_format=source_format,
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+    )
+    if fmt == "csv":
+        job_config.autodetect = True
+
+    with source.open("rb") as fh:
+        load_job = client.load_table_from_file(fh, table_ref, job_config=job_config)
+
+    load_job.result()
+    logger.info("Loaded %s into %s (WRITE_TRUNCATE)", source, table_ref)
+
+
+def update_routine(
+    project: str,
+    dataset: str,
+    name: str,
+    body: str,
+) -> None:
+    """Update the body of an existing BigQuery routine.
+
+    Works for both SQL and JavaScript routines — the ``language``
+    attribute is preserved from the existing routine definition.
+
+    Args:
+        project: GCP project ID.
+        dataset: BigQuery dataset ID.
+        name: Routine name.
+        body: New routine body (SQL or JS code).
+    """
+    client = bigquery.Client(project=project)
+    routine_ref = f"{project}.{dataset}.{name}"
+    routine = client.get_routine(routine_ref)
+    routine.body = body
+    client.update_routine(routine, ["body"])
+    logger.info("Updated routine %s.%s.%s", project, dataset, name)
+
+
+# ---------------------------------------------------------------------------
+# Delete functions (rm mode)
+# ---------------------------------------------------------------------------
+
+
+def delete_view(project: str, dataset: str, name: str) -> None:
+    """Delete a BigQuery view.
+
+    Args:
+        project: GCP project ID.
+        dataset: BigQuery dataset ID.
+        name: View name.
+    """
+    client = bigquery.Client(project=project)
+    table_ref = f"{project}.{dataset}.{name}"
+    client.delete_table(table_ref)
+    logger.info("Deleted view %s.%s.%s", project, dataset, name)
+
+
+def delete_table(project: str, dataset: str, name: str) -> None:
+    """Delete a BigQuery table.
+
+    Args:
+        project: GCP project ID.
+        dataset: BigQuery dataset ID.
+        name: Table name.
+    """
+    client = bigquery.Client(project=project)
+    table_ref = f"{project}.{dataset}.{name}"
+    client.delete_table(table_ref)
+    logger.info("Deleted table %s.%s.%s", project, dataset, name)
+
+
+def delete_routine(project: str, dataset: str, name: str) -> None:
+    """Delete a BigQuery routine.
+
+    Args:
+        project: GCP project ID.
+        dataset: BigQuery dataset ID.
+        name: Routine name.
+    """
+    client = bigquery.Client(project=project)
+    routine_ref = f"{project}.{dataset}.{name}"
+    client.delete_routine(routine_ref)
+    logger.info("Deleted routine %s.%s.%s", project, dataset, name)
+
+
+def delete_saved_query(project: str, region: str, name: str) -> None:
+    """Delete a saved query via Dataform API.
+
+    Locates the Dataform repository matching *name* and deletes it.
+
+    Args:
+        project: GCP project ID.
+        region: GCP region (e.g. ``us-east1``).
+        name: Saved query display name.
+
+    Raises:
+        ValueError: If the saved query is not found.
+    """
+    options = client_options_lib.ClientOptions(quota_project_id=project)
+    client = dataform.DataformClient(client_options=options)
+    parent = f"projects/{project}/locations/{region}"
+
+    target_repo = None
+    for repo in client.list_repositories(parent=parent):
+        if repo.display_name == name:
+            target_repo = repo
+            break
+
+    if target_repo is None:
+        msg = (
+            f"Saved query '{name}' not found in project '{project}' region '{region}'."
+        )
+        raise ValueError(msg)
+
+    client.delete_repository(name=target_repo.name, force=True)
+    logger.info("Deleted saved query '%s'", name)
