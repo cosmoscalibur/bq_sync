@@ -478,7 +478,9 @@ def update_table_description(
         new_schema = []
         for sf in table.schema:
             if sf.name in fields_map:
-                sf = sf._replace(description=fields_map[sf.name])
+                api_repr = sf.to_api_repr()
+                api_repr["description"] = fields_map[sf.name]
+                sf = bigquery.SchemaField.from_api_repr(api_repr)
             new_schema.append(sf)
         table.schema = new_schema
 
@@ -609,6 +611,28 @@ def update_routine(
     routine.body = body
     client.update_routine(routine, ["body"])
     logger.info("Updated routine %s.%s.%s", project, dataset, name)
+
+
+def update_routine_description(
+    project: str,
+    dataset: str,
+    name: str,
+    description: str,
+) -> None:
+    """Update the description of an existing BigQuery routine.
+
+    Args:
+        project: GCP project ID.
+        dataset: BigQuery dataset ID.
+        name: Routine name.
+        description: New routine description.
+    """
+    client = bigquery.Client(project=project)
+    routine_ref = f"{project}.{dataset}.{name}"
+    routine = client.get_routine(routine_ref)
+    routine.description = description
+    client.update_routine(routine, ["description"])
+    logger.info("Updated routine description %s.%s.%s", project, dataset, name)
 
 
 # ---------------------------------------------------------------------------

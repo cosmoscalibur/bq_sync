@@ -8,7 +8,7 @@ resolution-markers = [
 
 [[package]]
 name = "bq-sync"
-version = "0.1.3"
+version = "0.1.5"
 source = { editable = "." }
 dependencies = [
     { name = "google-cloud-bigquery" },

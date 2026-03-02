@@ -157,6 +157,12 @@ def _push_file(
         update = read_routine_sql(file)
         bq_client.update_routine(project, dataset, update.name, update.body)
 
+    elif resource_type == _ROUTINE_DIR and file.suffix == ".yaml":
+        update = read_model_yaml(file)
+        bq_client.update_routine_description(
+            project, dataset, update.name, update.description
+        )
+
     elif resource_type == _SAVED_QUERY_DIR and file.suffix == ".sql":
         update = read_saved_query_sql(file)
         bq_client.update_saved_query(project, region, update.name, update.sql)
@@ -171,10 +177,10 @@ def _push_file(
 
 
 def _git_changed_files(output_root: Path) -> list[Path] | None:
-    """Return uncommitted changed files via ``git status``.
+    """Return uncommitted changed files via ``git diff``.
 
-    Returns ``None`` when git is not available or the directory is not
-    a git repository.
+    Combines unstaged and staged changes.  Returns ``None`` when git
+    is not available or the directory is not a git repository.
 
     Args:
         output_root: Directory to check.
@@ -193,9 +199,19 @@ def _git_changed_files(output_root: Path) -> list[Path] | None:
             cwd=work_dir,
         )
         repo_root = Path(toplevel.stdout.strip())
+        logger.debug("Git repo root: %s", repo_root)
 
-        result = subprocess.run(
-            ["git", "status", "--porcelain", "--", str(output_root)],
+        # Unstaged changes.
+        unstaged = subprocess.run(
+            ["git", "diff", "--name-only", "--", str(output_root)],
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=work_dir,
+        )
+        # Staged changes.
+        staged = subprocess.run(
+            ["git", "diff", "--name-only", "--cached", "--", str(output_root)],
             capture_output=True,
             text=True,
             check=True,
@@ -204,15 +220,20 @@ def _git_changed_files(output_root: Path) -> list[Path] | None:
     except (subprocess.CalledProcessError, OSError, FileNotFoundError):
         return None
 
+    raw_lines = unstaged.stdout.strip() + "\n" + staged.stdout.strip()
+    logger.debug("git diff raw output:\n%s", raw_lines)
+
+    seen: set[Path] = set()
     files: list[Path] = []
-    for line in result.stdout.strip().splitlines():
+    for line in raw_lines.strip().splitlines():
+        line = line.strip()
         if not line:
             continue
-        # porcelain format: "XY <path>" or "XY <path> -> <path>"
-        raw_path = line[3:].split(" -> ")[-1].strip()
-        # Paths are relative to the repo root, not to output_root.
-        p = (repo_root / raw_path).resolve()
-        if p.is_file():
+        p = (repo_root / line).resolve()
+        is_file = p.is_file()
+        logger.debug("  path=%r  resolved=%s  is_file=%s", line, p, is_file)
+        if is_file and p not in seen:
+            seen.add(p)
             files.append(p)
     return files
 
@@ -247,7 +268,29 @@ def _filter_pushable(files: list[Path], output_root: Path) -> list[Path]:
     Returns:
         Filtered list of pushable files.
     """
-    return [f for f in files if _classify_path(f, output_root) is not None]
+    result = []
+    for f in files:
+        classified = _classify_path(f, output_root)
+        logger.debug("  classify %s -> %s", f, classified)
+        if classified is not None:
+            result.append(f)
+    return result
+
+
+# SQL priority map: lower value = pushed first.
+_SUFFIX_PRIORITY = {".sql": 0, ".yaml": 1}
+
+
+def _push_order(path: Path) -> int:
+    """Sort key: SQL files before YAML so structure exists for descriptions.
+
+    Args:
+        path: File path to sort.
+
+    Returns:
+        Integer priority (lower = earlier).
+    """
+    return _SUFFIX_PRIORITY.get(path.suffix, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +400,7 @@ def push_manual(
             logger.info("Push cancelled.")
             return
 
-    for f in pushable:
+    for f in sorted(pushable, key=_push_order):
         _push_file(f, output_root, project, region)
 
     if data_spec:
@@ -442,7 +485,7 @@ def push_auto(
             logger.info("Push cancelled.")
             return
 
-    for f in files:
+    for f in sorted(files, key=_push_order):
         _push_file(f, output_root, project, region)
 
     logger.info("Push complete.")
