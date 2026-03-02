@@ -182,13 +182,24 @@ def _git_changed_files(output_root: Path) -> list[Path] | None:
     Returns:
         List of changed file paths, or ``None`` when git is unavailable.
     """
+    work_dir = output_root if output_root.is_dir() else output_root.parent
     try:
+        # Discover the repo root so paths resolve correctly.
+        toplevel = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=work_dir,
+        )
+        repo_root = Path(toplevel.stdout.strip())
+
         result = subprocess.run(
             ["git", "status", "--porcelain", "--", str(output_root)],
             capture_output=True,
             text=True,
             check=True,
-            cwd=output_root if output_root.is_dir() else output_root.parent,
+            cwd=work_dir,
         )
     except (subprocess.CalledProcessError, OSError, FileNotFoundError):
         return None
@@ -199,7 +210,8 @@ def _git_changed_files(output_root: Path) -> list[Path] | None:
             continue
         # porcelain format: "XY <path>" or "XY <path> -> <path>"
         raw_path = line[3:].split(" -> ")[-1].strip()
-        p = (output_root / raw_path).resolve()
+        # Paths are relative to the repo root, not to output_root.
+        p = (repo_root / raw_path).resolve()
         if p.is_file():
             files.append(p)
     return files
