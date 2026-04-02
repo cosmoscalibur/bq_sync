@@ -251,3 +251,7 @@ def pull_project(
     )
 
     logger.info("Pull complete.")
+    logger.info(
+        "Hint: review changes with 'git diff' and commit "
+        "with 'git add -A && git commit'."
+    )

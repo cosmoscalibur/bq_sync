@@ -5,11 +5,17 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from bq_sync.cli import _build_parser
 from bq_sync.config import ProjectConfig, SyncConfig
 from bq_sync.push import (
     _classify_path,
+    _confirm,
+    _display_changeset,
+    _filter_auto_pushable,
     _filter_pushable,
+    _is_materialized_model,
     _mtime_changed_files,
     push_auto,
     push_manual,
@@ -243,6 +249,115 @@ class TestPushAutoDryRun:
 
         mock_bq.update_view.assert_not_called()
 
+    def test_auto_dry_run_use_mtime(self, tmp_path: Path) -> None:
+        """Auto dry-run with use_mtime skips git detection."""
+        config = _make_config()
+        config_path = tmp_path / "bq_sync.toml"
+        config_path.write_text("[project]\n[sync]\n")
+
+        output_root = _make_output_tree(tmp_path)
+        view = output_root / "my_dataset" / "views" / "v.sql"
+        view.write_text("SELECT 1")
+
+        with (
+            patch(
+                "bq_sync.push.resolve_output_dir",
+                return_value=output_root,
+            ),
+            patch("bq_sync.push._git_changed_files") as mock_git,
+            patch(
+                "bq_sync.push._mtime_changed_files",
+                return_value=[view],
+            ),
+            patch("bq_sync.push.bq_client"),
+        ):
+            push_auto(
+                config,
+                config_path,
+                dry_run=True,
+                use_mtime=True,
+                since_hours=48.0,
+            )
+
+        mock_git.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Materialized model filtering
+# ---------------------------------------------------------------------------
+
+
+class TestIsMaterializedModel:
+    """Tests for ``_is_materialized_model``."""
+
+    def test_table_model_without_sql_is_materialized(self, tmp_path: Path) -> None:
+        """Model YAML with no views/ or routines/ SQL is materialized."""
+        output_root = _make_output_tree(tmp_path)
+        model = output_root / "my_dataset" / "models" / "events.yaml"
+        model.write_text("name: events")
+
+        assert _is_materialized_model(model, output_root) is True
+
+    def test_view_model_with_sql_is_not_materialized(self, tmp_path: Path) -> None:
+        """Model YAML with a companion view SQL is NOT materialized."""
+        output_root = _make_output_tree(tmp_path)
+        view_sql = output_root / "my_dataset" / "views" / "v.sql"
+        view_sql.write_text("SELECT 1")
+        model = output_root / "my_dataset" / "models" / "v.yaml"
+        model.write_text("name: v")
+
+        assert _is_materialized_model(model, output_root) is False
+
+    def test_routine_model_with_sql_is_not_materialized(self, tmp_path: Path) -> None:
+        """Model YAML with a companion routine SQL is NOT materialized."""
+        output_root = _make_output_tree(tmp_path)
+        routine_sql = output_root / "my_dataset" / "routines" / "fn.sql"
+        routine_sql.write_text("RETURN 1;")
+        model = output_root / "my_dataset" / "models" / "fn.yaml"
+        model.write_text("name: fn")
+
+        assert _is_materialized_model(model, output_root) is False
+
+    def test_non_model_file_is_not_materialized(self, tmp_path: Path) -> None:
+        """SQL file in views/ is not a materialized model."""
+        output_root = _make_output_tree(tmp_path)
+        view_sql = output_root / "my_dataset" / "views" / "v.sql"
+        view_sql.write_text("SELECT 1")
+
+        assert _is_materialized_model(view_sql, output_root) is False
+
+
+class TestFilterAutoPushable:
+    """Tests for ``_filter_auto_pushable``."""
+
+    def test_excludes_materialized_by_default(self, tmp_path: Path) -> None:
+        """Materialized model YAMLs are excluded by default."""
+        output_root = _make_output_tree(tmp_path)
+        view_sql = output_root / "my_dataset" / "views" / "v.sql"
+        view_sql.write_text("SELECT 1")
+        view_model = output_root / "my_dataset" / "models" / "v.yaml"
+        view_model.write_text("name: v")
+        table_model = output_root / "my_dataset" / "models" / "events.yaml"
+        table_model.write_text("name: events")
+
+        files = [view_sql, view_model, table_model]
+        result = _filter_auto_pushable(files, output_root)
+
+        assert view_sql in result
+        assert view_model in result
+        assert table_model not in result
+
+    def test_include_models_keeps_all(self, tmp_path: Path) -> None:
+        """With include_models=True, nothing is excluded."""
+        output_root = _make_output_tree(tmp_path)
+        table_model = output_root / "my_dataset" / "models" / "events.yaml"
+        table_model.write_text("name: events")
+
+        files = [table_model]
+        result = _filter_auto_pushable(files, output_root, include_models=True)
+
+        assert table_model in result
+
 
 # ---------------------------------------------------------------------------
 # CLI parsing
@@ -258,25 +373,25 @@ class TestPushCLIParsing:
         args = parser.parse_args(["push"])
 
         assert args.command == "push"
-        assert args.path is None
+        assert args.paths == []
         assert args.data is None
-        assert args.since == 24.0
+        assert args.since is None
         assert args.dry_run is False
         assert args.yes is False
 
-    def test_manual_mode_path(self) -> None:
-        """``--path`` triggers manual mode."""
+    def test_manual_mode_single_path(self) -> None:
+        """Single positional path triggers manual mode."""
         parser = _build_parser()
-        args = parser.parse_args(["push", "--path", "view.sql"])
+        args = parser.parse_args(["push", "view.sql"])
 
-        assert args.path == ["view.sql"]
+        assert args.paths == ["view.sql"]
 
     def test_manual_mode_multiple_paths(self) -> None:
-        """Multiple ``--path`` flags accumulate."""
+        """Multiple positional paths accumulate."""
         parser = _build_parser()
-        args = parser.parse_args(["push", "--path", "a.sql", "--path", "b.yaml"])
+        args = parser.parse_args(["push", "a.sql", "b.yaml"])
 
-        assert args.path == ["a.sql", "b.yaml"]
+        assert args.paths == ["a.sql", "b.yaml"]
 
     def test_data_flag(self) -> None:
         """``--data`` accepts source and destination."""
@@ -382,3 +497,100 @@ class TestRmCLIParsing:
         args = parser.parse_args(["rm", "view.sql", "-y"])
 
         assert args.yes is True
+
+
+class TestIncludeModelsCLI:
+    """Verify ``--include-models`` flag parsing."""
+
+    def test_include_models_flag(self) -> None:
+        """``--include-models`` enables materialized model push."""
+        parser = _build_parser()
+        args = parser.parse_args(["push", "--include-models"])
+
+        assert args.include_models is True
+
+    def test_include_models_default_false(self) -> None:
+        """``--include-models`` defaults to ``False``."""
+        parser = _build_parser()
+        args = parser.parse_args(["push"])
+
+        assert args.include_models is False
+
+
+class TestVersionFlag:
+    """Verify ``--version`` flag."""
+
+    def test_version_output(self) -> None:
+        """``--version`` prints version and exits."""
+        parser = _build_parser()
+        with pytest.raises(SystemExit) as exc_info:
+            parser.parse_args(["--version"])
+
+        assert exc_info.value.code == 0
+
+
+class TestDisplayChangeset:
+    """Verify ``_display_changeset`` output formatting."""
+
+    def test_tagged_output(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Files are displayed with resource-type tags."""
+        output_root = _make_output_tree(tmp_path)
+        view = output_root / "my_dataset" / "views" / "active.sql"
+        view.write_text("SELECT 1")
+
+        _display_changeset("Files to push", [view], output_root)
+
+        captured = capsys.readouterr()
+        assert "[views]" in captured.out
+        assert "active.sql" in captured.out
+        assert "Files to push:" in captured.out
+
+    def test_extra_items(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Extra items appear after file list."""
+        output_root = _make_output_tree(tmp_path)
+
+        _display_changeset(
+            "Files to push",
+            [],
+            output_root,
+            extra_items=["[table-replace] data.csv -> proj/ds/tbl"],
+        )
+
+        captured = capsys.readouterr()
+        assert "[table-replace]" in captured.out
+
+
+class TestConfirm:
+    """Verify ``_confirm`` helper."""
+
+    def test_yes_input(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``y`` input returns ``True``."""
+        monkeypatch.setattr("builtins.input", lambda _: "y")
+
+        assert _confirm("Proceed?") is True
+
+    def test_no_input(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``n`` input returns ``False``."""
+        monkeypatch.setattr("builtins.input", lambda _: "n")
+
+        assert _confirm("Proceed?") is False
+
+    def test_empty_input(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Empty input (enter) returns ``False`` (default-deny)."""
+        monkeypatch.setattr("builtins.input", lambda _: "")
+
+        assert _confirm("Proceed?") is False
+
+    def test_eof_returns_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``EOFError`` (piped stdin) returns ``False``."""
+
+        def raise_eof(_: str) -> str:
+            raise EOFError
+
+        monkeypatch.setattr("builtins.input", raise_eof)
+
+        assert _confirm("Proceed?") is False

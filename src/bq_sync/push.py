@@ -2,8 +2,8 @@
 
 Supports two modes:
 
-- **Manual**: push explicitly listed files via ``--path``, and
-  optionally replace a table via ``--data``.
+- **Manual**: push explicitly listed files (positional arguments),
+  and optionally replace a table via ``--data``.
 - **Auto**: detect changed files (via ``git status`` or file mtime)
   and push them after interactive confirmation.
 """
@@ -277,6 +277,67 @@ def _filter_pushable(files: list[Path], output_root: Path) -> list[Path]:
     return result
 
 
+def _is_materialized_model(file: Path, output_root: Path) -> bool:
+    """Check if a model YAML has no corresponding SQL source.
+
+    A model YAML is "materialized" (table or external table) when
+    no companion ``.sql`` file exists under ``views/`` or
+    ``routines/`` for the same dataset and resource name.
+
+    Args:
+        file: Absolute path to a model YAML file.
+        output_root: Project-scoped output directory.
+
+    Returns:
+        ``True`` when the model has no SQL counterpart.
+    """
+    classified = _classify_path(file, output_root)
+    if classified is None:
+        return False
+
+    resource_type, dataset, name = classified
+    if resource_type != _MODEL_DIR or file.suffix != ".yaml":
+        return False
+
+    # Project-level models have no dataset.
+    if not dataset:
+        return False
+
+    ds_dir = output_root / dataset
+    view_sql = ds_dir / _VIEW_DIR / f"{name}.sql"
+    routine_sql = ds_dir / _ROUTINE_DIR / f"{name}.sql"
+    return not view_sql.is_file() and not routine_sql.is_file()
+
+
+def _filter_auto_pushable(
+    files: list[Path],
+    output_root: Path,
+    *,
+    include_models: bool = False,
+) -> list[Path]:
+    """Filter files for auto-push, optionally excluding materialized models.
+
+    Args:
+        files: Candidate file paths (already classified as pushable).
+        output_root: Project-scoped output directory.
+        include_models: When ``False``, exclude materialized model
+            YAMLs (tables and external tables without SQL sources).
+
+    Returns:
+        Filtered list of auto-pushable files.
+    """
+    if include_models:
+        return files
+
+    result = []
+    for f in files:
+        if _is_materialized_model(f, output_root):
+            logger.debug("  skip materialized model %s", f)
+            continue
+        result.append(f)
+    return result
+
+
 # SQL priority map: lower value = pushed first.
 _SUFFIX_PRIORITY = {".sql": 0, ".yaml": 1}
 
@@ -298,17 +359,22 @@ def _push_order(path: Path) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _confirm_changeset(files: list[Path], output_root: Path) -> bool:
-    """Print a changeset report and prompt the user for confirmation.
+def _display_changeset(
+    header: str,
+    files: list[Path],
+    output_root: Path,
+    *,
+    extra_items: list[str] | None = None,
+) -> None:
+    """Print a tagged changeset to stdout.
 
     Args:
-        files: Files that will be pushed.
+        header: Section header (e.g. ``"Files to push"``).
+        files: Files in the changeset.
         output_root: Project-scoped output directory.
-
-    Returns:
-        ``True`` if the user confirms, ``False`` otherwise.
+        extra_items: Additional free-text items to display.
     """
-    print("\n  Files to push:\n")
+    print(f"\n  {header}:\n")
     for f in files:
         try:
             rel = f.relative_to(output_root.resolve())
@@ -317,10 +383,24 @@ def _confirm_changeset(files: list[Path], output_root: Path) -> bool:
         classified = _classify_path(f, output_root)
         tag = classified[0] if classified else "unknown"
         print(f"    [{tag}] {rel}")
-
+    for item in extra_items or []:
+        print(f"    {item}")
     print()
+
+
+def _confirm(prompt: str) -> bool:
+    """Prompt the user for ``[y/N]`` confirmation.
+
+    Handles ``EOFError`` and ``KeyboardInterrupt`` gracefully.
+
+    Args:
+        prompt: Prompt text shown before ``[y/N]``.
+
+    Returns:
+        ``True`` if the user confirms, ``False`` otherwise.
+    """
     try:
-        answer = input("  Proceed with push? [y/N] ").strip().lower()
+        answer = input(f"  {prompt} [y/N] ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
         return False
@@ -362,41 +442,25 @@ def push_manual(
     for f in unpushable:
         logger.warning("Cannot classify, will skip: %s", f)
 
-    all_items: list[str] = []
-    for f in pushable:
-        try:
-            rel = f.relative_to(output_root.resolve())
-        except ValueError:
-            rel = f
-        all_items.append(str(rel))
-
+    extra: list[str] = []
     if data_spec:
-        all_items.append(
+        extra.append(
             f"[table-replace] {data_spec.source} -> "
             f"{data_spec.project}/{data_spec.dataset}/{data_spec.table}"
         )
 
-    if not all_items:
+    if not pushable and not extra:
         logger.info("Nothing to push.")
         return
 
-    # Always show what will be pushed.
-    print("\n  Files to push:\n")
-    for item in all_items:
-        print(f"    {item}")
-    print()
+    _display_changeset("Files to push", pushable, output_root, extra_items=extra)
 
     if dry_run:
         logger.info("Dry-run: no changes written.")
         return
 
     if not yes:
-        try:
-            answer = input("  Proceed with push? [y/N] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
-        if answer not in ("y", "yes"):
+        if not _confirm("Proceed with push?"):
             logger.info("Push cancelled.")
             return
 
@@ -413,6 +477,7 @@ def push_manual(
         )
 
     logger.info("Push complete.")
+    logger.info("Hint: commit pushed changes with 'git commit'.")
 
 
 def push_auto(
@@ -422,6 +487,8 @@ def push_auto(
     dry_run: bool = False,
     yes: bool = False,
     since_hours: float = 24.0,
+    include_models: bool = False,
+    use_mtime: bool = False,
 ) -> None:
     """Detect changed files and push them after confirmation.
 
@@ -430,12 +497,19 @@ def push_auto(
     1. **Git** (preferred): ``git status --porcelain`` on the output root.
     2. **Fallback**: files with ``mtime`` within *since_hours*.
 
+    When *use_mtime* is ``True``, git detection is skipped and mtime
+    is used directly.
+
     Args:
         config: Parsed sync configuration.
         config_path: Path to the ``bq_sync.toml`` that was loaded.
         dry_run: If ``True``, preview without writing.
         yes: If ``True``, skip interactive confirmation.
         since_hours: Look-back window for the mtime fallback (hours).
+        include_models: When ``True``, include materialized model
+            YAMLs in the changeset.  Defaults to ``False``.
+        use_mtime: When ``True``, skip git detection and use
+            mtime-based file scanning directly.
     """
     output_root = resolve_output_dir(config, config_path)
     project = config.project.id
@@ -445,20 +519,29 @@ def push_auto(
         logger.error("Output root does not exist: %s", output_root)
         sys.exit(1)
 
-    # 1. Try git.
-    git_files = _git_changed_files(output_root)
-    if git_files is not None:
-        files = _filter_pushable(git_files, output_root)
-        source_label = "git status"
-    else:
-        # 2. Fallback to mtime.
-        logger.info(
-            "Git not available, falling back to mtime (last %.1f hours).",
-            since_hours,
-        )
+    if use_mtime:
+        # Explicit mtime mode — skip git entirely.
         mtime_files = _mtime_changed_files(output_root, since_hours)
         files = _filter_pushable(mtime_files, output_root)
         source_label = f"mtime (last {since_hours}h)"
+    else:
+        # 1. Try git.
+        git_files = _git_changed_files(output_root)
+        if git_files is not None:
+            files = _filter_pushable(git_files, output_root)
+            source_label = "git status"
+        else:
+            # 2. Fallback to mtime.
+            logger.info(
+                "Git not available, falling back to mtime (last %.1f hours).",
+                since_hours,
+            )
+            mtime_files = _mtime_changed_files(output_root, since_hours)
+            files = _filter_pushable(mtime_files, output_root)
+            source_label = f"mtime (last {since_hours}h)"
+
+    # Exclude materialized models unless explicitly included.
+    files = _filter_auto_pushable(files, output_root, include_models=include_models)
 
     if not files:
         logger.info("No changed files detected via %s.", source_label)
@@ -467,21 +550,13 @@ def push_auto(
     logger.info("Detected %d changed file(s) via %s.", len(files), source_label)
 
     if dry_run:
-        print("\n  Files that would be pushed:\n")
-        for f in files:
-            try:
-                rel = f.relative_to(output_root.resolve())
-            except ValueError:
-                rel = f
-            classified = _classify_path(f, output_root)
-            tag = classified[0] if classified else "unknown"
-            print(f"    [{tag}] {rel}")
-        print()
+        _display_changeset("Files that would be pushed", files, output_root)
         logger.info("Dry-run: no changes written.")
         return
 
     if not yes:
-        if not _confirm_changeset(files, output_root):
+        _display_changeset("Files to push", files, output_root)
+        if not _confirm("Proceed with push?"):
             logger.info("Push cancelled.")
             return
 
@@ -489,7 +564,7 @@ def push_auto(
         _push_file(f, output_root, project, region)
 
     logger.info("Push complete.")
-    logger.info("Recommendation: commit the pushed changes with git.")
+    logger.info("Hint: commit pushed changes with 'git commit'.")
 
 
 # ---------------------------------------------------------------------------
@@ -582,28 +657,14 @@ def rm_resources(
         logger.info("Nothing to remove.")
         return
 
-    print("\n  Resources to delete (BQ + local):\n")
-    for f in removable:
-        try:
-            rel = f.relative_to(output_root.resolve())
-        except ValueError:
-            rel = f
-        classified = _classify_path(f, output_root)
-        tag = classified[0] if classified else "unknown"
-        print(f"    [{tag}] {rel}")
-    print()
+    _display_changeset("Resources to delete (BQ + local)", removable, output_root)
 
     if dry_run:
         logger.info("Dry-run: no resources deleted.")
         return
 
     if not yes:
-        try:
-            answer = input("  Proceed with deletion? [y/N] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
-        if answer not in ("y", "yes"):
+        if not _confirm("Proceed with deletion?"):
             logger.info("Deletion cancelled.")
             return
 
@@ -611,3 +672,4 @@ def rm_resources(
         _rm_file(f, output_root, project, region)
 
     logger.info("Deletion complete.")
+    logger.info("Hint: commit deletions with 'git add -A && git commit'.")

@@ -181,9 +181,10 @@ def _format_schema_lines(schema: list[dict[str, str]]) -> list[str]:
     lines = ["schema:"]
     for field in schema:
         desc = field.get("description", "")
+        desc_json = json.dumps(desc, ensure_ascii=False)
         entry = (
             f"  - name: {field['name']}  type: {field['type']}"
-            f"  mode: {field['mode']}  description: {json.dumps(desc)}"
+            f"  mode: {field['mode']}  description: {desc_json}"
         )
         lines.append(entry)
     return lines
@@ -207,7 +208,7 @@ def write_model_yaml(path: Path, table: TableInfo) -> None:
     schema = _merge_field_descriptions(table.schema, local_fields)
     lines = [
         f"name: {table.name}",
-        f"description: {json.dumps(desc)}",
+        f"description: {json.dumps(desc, ensure_ascii=False)}",
         f"row_count: {table.row_count}",
     ]
     if table.created:
@@ -249,7 +250,7 @@ def write_view_model_yaml(path: Path, view: ViewInfo) -> None:
     schema = _merge_field_descriptions(view.schema, local_fields)
     lines = [
         f"name: {view.name}",
-        f"description: {json.dumps(desc)}",
+        f"description: {json.dumps(desc, ensure_ascii=False)}",
         "type: VIEW",
     ]
     if view.created:
@@ -277,7 +278,7 @@ def write_routine_model_yaml(path: Path, routine: RoutineInfo) -> None:
     desc = _merge_description(routine.description, local_desc)
     lines = [
         f"name: {routine.name}",
-        f"description: {json.dumps(desc)}",
+        f"description: {json.dumps(desc, ensure_ascii=False)}",
         f"language: {routine.language}",
     ]
     if routine.created:
@@ -311,7 +312,7 @@ def write_external_definition(path: Path, ext: ExternalTableInfo) -> None:
     schema = _merge_field_descriptions(ext.schema, local_fields)
     lines = [
         f"name: {ext.name}",
-        f"description: {json.dumps(desc)}",
+        f"description: {json.dumps(desc, ensure_ascii=False)}",
         f"source_format: {ext.source_format}",
         "source_uris:",
     ]

@@ -7,6 +7,7 @@ import logging
 import sys
 from pathlib import Path
 
+from bq_sync import __version__
 from bq_sync.config import SyncConfig, discover_config, load_config, resolve_output_dir
 from bq_sync.pull import pull_project
 
@@ -16,6 +17,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bq-sync",
         description="Sync BigQuery resources to a local directory.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
     parser.add_argument(
         "-v",
@@ -67,11 +73,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Deploy local resources to BigQuery.",
     )
     push_parser.add_argument(
-        "--path",
-        type=str,
-        action="append",
-        default=None,
-        help="Manual mode: push a specific file (repeatable).",
+        "paths",
+        nargs="*",
+        default=[],
+        help="Manual mode: files to push (positional).",
     )
     push_parser.add_argument(
         "--data",
@@ -86,10 +91,10 @@ def _build_parser() -> argparse.ArgumentParser:
     push_parser.add_argument(
         "--since",
         type=float,
-        default=24.0,
+        default=None,
         help=(
-            "Auto mode fallback: hours to look back for modified files "
-            "when git is unavailable (default: 24)."
+            "Auto mode: use mtime-based detection with the given "
+            "look-back window in hours (skips git detection)."
         ),
     )
     push_parser.add_argument(
@@ -102,6 +107,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--yes",
         action="store_true",
         help="Skip interactive confirmation prompt.",
+    )
+    push_parser.add_argument(
+        "--include-models",
+        action="store_true",
+        help=("Auto mode: include materialized model YAMLs (excluded by default)."),
     )
     push_parser.add_argument(
         "--config",
@@ -183,10 +193,8 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(levelname)s: %(message)s",
-    )
+    fmt = "%(levelname)s: %(message)s" if args.verbose else "%(message)s"
+    logging.basicConfig(level=level, format=fmt)
 
     if args.command == "push":
         _handle_push(args)
@@ -256,7 +264,9 @@ def _handle_push(args: argparse.Namespace) -> None:
         dest_parts = dest_str.split("/")
         if len(dest_parts) != 3:
             logging.error(
-                "Invalid --data destination '%s': expected project/dataset/table.",
+                "Invalid --data destination '%s': expected "
+                "project/dataset/table "
+                "(e.g. 'my-project/my_dataset/my_table').",
                 dest_str,
             )
             sys.exit(1)
@@ -270,24 +280,28 @@ def _handle_push(args: argparse.Namespace) -> None:
             fmt=fmt,
         )
 
-    is_manual = args.path or args.data
+    is_manual = args.paths or args.data
 
     if is_manual:
         push_manual(
             config,
             config_path,
-            paths=args.path or [],
+            paths=args.paths,
             dry_run=args.dry_run,
             yes=args.yes,
             data_spec=data_spec,
         )
     else:
+        use_mtime = args.since is not None
+        since_hours = args.since if use_mtime else 24.0
         push_auto(
             config,
             config_path,
             dry_run=args.dry_run,
             yes=args.yes,
-            since_hours=args.since,
+            since_hours=since_hours,
+            include_models=args.include_models,
+            use_mtime=use_mtime,
         )
 
 
@@ -403,7 +417,8 @@ def _handle_fetch(args: argparse.Namespace) -> None:
             "<project>/<dataset>/<table_or_view>, "
             "<project>/<dataset>/<resource_type>/<table_or_view>, or "
             "<project>/saved_queries/<name> "
-            "but got %d segments.",
+            "but got %d segments. "
+            "Example: my-project/my_dataset/my_view",
             args.model,
             len(parts),
         )

@@ -30,17 +30,18 @@ uv pip install .
 
 ## CLI Usage
 
-```
+```text
+bq-sync [--version] [-v]
 bq-sync pull  [--dataset DATASET] [--dry-run] [--config PATH] [--force] [--force-file FILE]
 bq-sync fetch <project/dataset/model> [-f csv|parquet] [-o DIR] [--config PATH]
-bq-sync push  [--path FILE]... [--data SOURCE DEST] [--since HOURS] [--dry-run] [--yes] [--config PATH]
+bq-sync push  [FILE ...] [--data SOURCE DEST] [--since HOURS] [--dry-run] [--yes] [--include-models] [--config PATH]
 bq-sync rm    <path>... [--dry-run] [--yes] [--config PATH]
 ```
 
 ### pull options
 
 | Flag | Description |
-|---|---|
+| --- | --- |
 | `--config` | Path to `bq_sync.toml` (default: auto-discover from CWD upward) |
 | `--dataset` | Sync a single dataset (default: all configured) |
 | `--dry-run` | Preview actions without writing files |
@@ -51,7 +52,7 @@ bq-sync rm    <path>... [--dry-run] [--yes] [--config PATH]
 ### fetch options
 
 | Flag | Description |
-|---|---|
+| --- | --- |
 | `model` (positional) | BigQuery resource path: `<project>/<dataset>/<model>` or `<project>/<dataset>/<resource_type>/<model>` |
 | `-f`, `--format` | Output format: `csv` (default) or `parquet` |
 | `-o`, `--output-dir` | Directory where a `data/` folder is created (default: config output dir) |
@@ -59,18 +60,23 @@ bq-sync rm    <path>... [--dry-run] [--yes] [--config PATH]
 
 ### push options
 
-If neither `--path` nor `--data` is provided, **auto mode** is used: detect
-changed files via `git status` (preferred) or by file modification time
-(`--since`).  Both modes print the changeset and prompt for `y/N` confirmation.
+If no positional file paths or `--data` is provided, **auto mode** is used:
+detect changed files via `git status` (preferred) or by file modification time
+when `--since` is explicitly set.  Both modes print the changeset and prompt for
+`y/N` confirmation.
+
+By default, auto mode excludes materialized model YAMLs (tables without a
+corresponding SQL file).  Use `--include-models` to include them.
 
 Pushable resources: views (SQL), routines (SQL/JS), models (YAML descriptions),
 and saved queries (SQL).
 
 | Flag | Description |
-|---|---|
-| `--path FILE` | Manual mode: push a specific file (repeatable) |
+| --- | --- |
+| `FILE` (positional) | Manual mode: files to push (one or more) |
 | `--data SOURCE DEST` | Table-replace: local CSV/Parquet path + `project/dataset/table` (manual only) |
-| `--since HOURS` | Fallback look-back window when git is unavailable (default: 24) |
+| `--since HOURS` | Auto mode: use mtime-based detection with the given look-back window (skips git) |
+| `--include-models` | Auto mode: include materialized model YAMLs (excluded by default) |
 | `--dry-run` | Preview changeset without writing to BQ |
 | `-y`, `--yes` | Skip interactive confirmation |
 | `--config` | Path to `bq_sync.toml` (default: auto-discover from CWD upward) |
@@ -80,7 +86,7 @@ and saved queries (SQL).
 Deletes the BQ resource first, then removes the local file on success.
 
 | Flag | Description |
-|---|---|
+| --- | --- |
 | `path` (positional) | Local file paths identifying BQ resources to delete (repeatable) |
 | `--dry-run` | Preview without deleting |
 | `-y`, `--yes` | Skip interactive confirmation |
@@ -100,7 +106,7 @@ output_dir = "."  # Relative to this config file
 
 ## Output Directory Structure
 
-```
+```text
 <output_dir>/
 └── <project_id>/
     ├── <dataset>/
@@ -119,7 +125,7 @@ Before any sync, uncommitted tracked changes in the output directory
 cause `bq-sync` to **warn and exit**. All files must be committed first.
 
 | BQ exists? | File exists? | Git history? | Condition | Action |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | Yes | No | — | — | Fetch |
 | Yes | Yes | No | — | Warn (pending commit) |
 | Yes | Yes | Yes | BQ ≤ git | Skip |

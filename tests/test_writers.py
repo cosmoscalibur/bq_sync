@@ -192,6 +192,30 @@ class TestWriteModelYaml:
         assert 'description: ""' in content
         assert content.count("description:") == 3  # table-level + 2 fields
 
+    def test_non_ascii_description_written_as_utf8(self, tmp_path: Path) -> None:
+        """Non-ASCII descriptions are written as raw UTF-8."""
+        table = TableInfo(
+            name="declaraciones",
+            schema=[
+                {
+                    "name": "tipo",
+                    "type": "STRING",
+                    "mode": "NULLABLE",
+                    "description": "Tipo de declaración",
+                },
+            ],
+            description="Información de declaración",
+            row_count=0,
+            modified=TS,
+        )
+        path = tmp_path / "models" / "declaraciones.yaml"
+        write_model_yaml(path, table)
+
+        content = path.read_text(encoding="utf-8")
+        assert "declaración" in content
+        assert "\\u00f3" not in content
+        assert "\\u00e9" not in content
+
 
 class TestWriteExternalDefinition:
     """Tests for ``write_external_definition``."""
