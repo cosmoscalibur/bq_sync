@@ -180,6 +180,43 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to bq_sync.toml (default: auto-discover from CWD).",
     )
 
+    # --- materialize ---
+    mat_parser = subparsers.add_parser(
+        "materialize",
+        help="Create a permanent table from a view or external table.",
+    )
+    mat_parser.add_argument(
+        "resource",
+        type=str,
+        help="Resource path: <project>/<dataset>/<name>.",
+    )
+    mat_parser.add_argument(
+        "--target",
+        type=str,
+        default=None,
+        help=(
+            "Target table name (default: replaces view_/external_ prefix "
+            "with materialize_)."
+        ),
+    )
+    mat_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print DDL without executing.",
+    )
+    mat_parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Skip interactive confirmation.",
+    )
+    mat_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to bq_sync.toml (default: auto-discover from CWD).",
+    )
+
     return parser
 
 
@@ -207,6 +244,9 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "rm":
         _handle_rm(args)
+
+    if args.command == "materialize":
+        _handle_materialize(args)
 
 
 def _resolve_config(args: argparse.Namespace) -> tuple[Path, SyncConfig]:
@@ -316,6 +356,21 @@ def _handle_rm(args: argparse.Namespace) -> None:
         paths=args.path,
         dry_run=args.dry_run,
         yes=args.yes,
+    )
+
+
+def _handle_materialize(args: argparse.Namespace) -> None:
+    """Handle the ``materialize`` subcommand."""
+    from bq_sync.materialize import materialize_resource
+
+    config_path, config = _resolve_config(args)
+    materialize_resource(
+        config,
+        config_path,
+        args.resource,
+        dry_run=args.dry_run,
+        yes=args.yes,
+        target_name=args.target,
     )
 
 
