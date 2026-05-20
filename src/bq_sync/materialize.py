@@ -8,11 +8,11 @@ the newly created table's model YAML so the local tree stays in sync.
 from __future__ import annotations
 
 import logging
-import sys
 from pathlib import Path
 
 from bq_sync import bq_client
 from bq_sync.config import SyncConfig, resolve_output_dir
+from bq_sync.utils import parse_resource_path
 from bq_sync.writers import write_model_yaml
 
 logger = logging.getLogger(__name__)
@@ -73,6 +73,7 @@ def _build_ddl(
     )
 
 
+
 def _confirm(prompt: str) -> bool:
     """Prompt for ``[y/N]`` confirmation.
 
@@ -101,9 +102,11 @@ def materialize_resource(
 ) -> None:
     """Materialize a view or external table into a permanent BQ table.
 
-    Resolution order for *resource_path*:
+    Accepts two path forms for *resource_path*:
 
-    - ``<project>/<dataset>/<name>`` — dataset-level resource.
+    - BQ tree: ``<project>/<dataset>/<name>[.yaml|.sql]``
+    - Local tree: ``<project>/<dataset>/<resource_dir>/<name>[.yaml|.sql]``
+      (e.g. the path as downloaded by ``bq-sync pull``)
 
     After the DDL executes successfully, the new table's metadata is
     pulled and written to the local model YAML without a full dataset
@@ -112,24 +115,17 @@ def materialize_resource(
     Args:
         config: Parsed sync configuration.
         config_path: Path to the ``bq_sync.toml`` that was loaded.
-        resource_path: Resource path in ``project/dataset/name`` form.
+        resource_path: Resource path (see above for accepted forms).
         dry_run: If ``True``, print the DDL and skip execution.
         yes: If ``True``, skip interactive confirmation.
         target_name: Override the target table name.  Defaults to
             the result of ``_default_target_name(source_name)``.
     """
     output_root = resolve_output_dir(config, config_path)
+    location = config.project.default_region
 
-    # Parse resource path.
-    parts = resource_path.split("/")
-    if len(parts) != 3:
-        logger.error(
-            "Invalid resource path '%s': expected <project>/<dataset>/<name>.",
-            resource_path,
-        )
-        sys.exit(1)
-
-    path_project, dataset, source_name = parts
+    # Parse accepts both 3-part BQ paths and 4-part local-tree paths.
+    path_project, dataset, source_name = parse_resource_path(resource_path)
 
     # Derive the target table name when not explicitly given.
     effective_target = target_name or _default_target_name(source_name)
@@ -156,7 +152,7 @@ def materialize_resource(
         source_name,
         effective_target,
     )
-    bq_client.run_query(path_project, ddl)
+    bq_client.run_query(path_project, ddl, location=location)
     logger.info("Materialization complete.")
 
     # Targeted auto-pull: fetch only the new table's metadata and write its

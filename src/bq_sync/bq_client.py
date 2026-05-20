@@ -975,7 +975,7 @@ def upsert_saved_query(project: str, region: str, name: str, sql: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def run_query(project: str, sql: str) -> None:
+def run_query(project: str, sql: str, location: str | None = None) -> None:
     """Execute a SQL statement (DDL or DML) on BigQuery.
 
     Blocks until the job completes.  Raises on job errors.
@@ -983,9 +983,14 @@ def run_query(project: str, sql: str) -> None:
     Args:
         project: GCP project ID.
         sql: SQL to execute.
+        location: BQ processing location (e.g. ``"us-east1"`` or ``"US"``).
+            When ``None`` the client uses its default, which may differ
+            from the dataset location and cause a NotFound error.
     """
     client = bigquery.Client(project=project)
-    job = client.query(sql)
+    # Pass location explicitly so the job runs where the dataset lives,
+    # avoiding "not found in location US" when the dataset is in us-east1.
+    job = client.query(sql, location=location)
     job.result()  # blocks; propagates any job error
     logger.info("Executed query on project '%s'.", project)
 

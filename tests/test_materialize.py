@@ -7,7 +7,11 @@ from unittest.mock import MagicMock, patch
 
 from bq_sync.cli import _build_parser
 from bq_sync.config import ProjectConfig, SyncConfig
-from bq_sync.materialize import _build_ddl, _default_target_name, materialize_resource
+from bq_sync.materialize import (
+    _build_ddl,
+    _default_target_name,
+    materialize_resource,
+)
 
 
 def _make_config() -> SyncConfig:
@@ -141,11 +145,13 @@ class TestMaterializeResourceExecution:
                 yes=True,
             )
 
-        # DDL executed.
+        # DDL executed — verify location kwarg is forwarded from config.
         mock_bq.run_query.assert_called_once()
-        ddl_arg = mock_bq.run_query.call_args[0][1]
+        call_args = mock_bq.run_query.call_args
+        ddl_arg = call_args[0][1]
         assert "CREATE OR REPLACE TABLE" in ddl_arg
         assert "materialize_foo" in ddl_arg
+        assert call_args.kwargs.get("location") == "us-east1"
 
         # Auto-pull: metadata fetched and YAML written.
         mock_bq.get_table_info.assert_called_once_with(
