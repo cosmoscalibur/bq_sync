@@ -443,3 +443,80 @@ class TestDescriptionPreservation:
         content = path.read_text()
         assert '"Local ext"' in content
         assert '"BQ ext"' not in content
+
+
+class TestUnicodeNormalization:
+    """Tests that all writers store text in NFC form regardless of BQ input."""
+
+    def test_view_sql_nfd_normalized_to_nfc(self, tmp_path: Path) -> None:
+        """View SQL received in NFD form is written as NFC bytes."""
+        import unicodedata
+
+        # Build an NFD string: "ó" as base "o" + combining acute accent (U+0301).
+        nfd_sql = "SELECT `ni\u006f\u0301t` FROM users"
+        nfc_sql = unicodedata.normalize("NFC", nfd_sql)
+
+        view = ViewInfo(name="v", sql=nfd_sql, modified=TS)
+        path = tmp_path / "v.sql"
+        write_view_sql(path, view)
+
+        on_disk = path.read_bytes().decode("utf-8")
+        # File must contain NFC form, not the raw NFD bytes.
+        assert unicodedata.is_normalized("NFC", on_disk)
+        assert nfc_sql in on_disk
+
+    def test_model_yaml_nfd_description_normalized(self, tmp_path: Path) -> None:
+        """Model YAML descriptions from BQ in NFD are stored as NFC."""
+        import unicodedata
+
+        # NFD "descripción": n + combining tilde (U+0303)
+        nfd_desc = "Descripcio\u006e\u0303 de la tabla"
+        nfc_desc = unicodedata.normalize("NFC", nfd_desc)
+
+        table = TableInfo(
+            name="t",
+            schema=[],
+            description=nfd_desc,
+            row_count=0,
+            modified=TS,
+        )
+        path = tmp_path / "t.yaml"
+        write_model_yaml(path, table)
+
+        content = path.read_bytes().decode("utf-8")
+        assert unicodedata.is_normalized("NFC", content)
+        assert nfc_desc in content
+
+    def test_model_yaml_stable_bytes_on_repeated_write(self, tmp_path: Path) -> None:
+        """Writing the same BQ content twice produces identical file bytes.
+
+        Verifies the round-trip: first pull (fresh file) and second pull
+        (file already exists with NFC) yield the same output, so ``git
+        diff`` reports no change.
+        """
+        nfd_desc = "Tipo de declaracio\u006e\u0301"
+        table = TableInfo(
+            name="t",
+            schema=[
+                {
+                    "name": "col",
+                    "type": "STRING",
+                    "mode": "NULLABLE",
+                    # Field description also in NFD.
+                    "description": "Declaracio\u006e\u0301 fiscal",
+                },
+            ],
+            description=nfd_desc,
+            row_count=0,
+            modified=TS,
+        )
+        path = tmp_path / "t.yaml"
+
+        write_model_yaml(path, table)
+        first_bytes = path.read_bytes()
+
+        # Second write simulates a subsequent pull with the same BQ content.
+        write_model_yaml(path, table)
+        second_bytes = path.read_bytes()
+
+        assert first_bytes == second_bytes
