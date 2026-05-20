@@ -46,6 +46,21 @@ class RoutineUpdate:
     language: str
 
 
+@dataclass(frozen=True)
+class RoutineModelUpdate:
+    """Full routine metadata read from a model YAML for create operations.
+
+    Used when the routine does not yet exist in BigQuery and must be
+    created with its full signature (arguments, return type).
+    """
+
+    name: str
+    description: str
+    language: str
+    arguments: list[dict[str, str]] = field(default_factory=list)
+    return_type: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # SQL readers
 # ---------------------------------------------------------------------------
@@ -281,4 +296,81 @@ def _parse_model_text(text: str, fallback_name: str) -> ModelUpdate:
         name=name,
         description=description,
         field_descriptions=field_descriptions,
+    )
+
+
+def read_routine_model_yaml(path: Path) -> RoutineModelUpdate:
+    """Parse a routine model YAML into a ``RoutineModelUpdate``.
+
+    Extracts ``name``, ``description``, ``language``, ``arguments``, and
+    ``return_type`` from the YAML produced by ``write_routine_model_yaml``.
+    Used on the upsert fallback path to supply a full routine signature
+    when the routine does not yet exist in BigQuery.
+
+    Args:
+        path: Path to the ``.yaml`` file produced by
+            ``write_routine_model_yaml``.
+
+    Returns:
+        A ``RoutineModelUpdate`` with all signature fields populated.
+    """
+    text = path.read_text(encoding="utf-8")
+    name: str = path.stem
+    description: str = ""
+    language: str = "SQL"
+    return_type: str | None = None
+    arguments: list[dict[str, str]] = []
+
+    in_arguments = False
+    for line in text.splitlines():
+        stripped = line.strip()
+
+        if not in_arguments:
+            val = _parse_yaml_field(stripped, "name")
+            if val is not None:
+                name = val
+                continue
+
+            val = _parse_yaml_field(stripped, "description")
+            if val is not None:
+                description = _decode_json_str(val)
+                continue
+
+            val = _parse_yaml_field(stripped, "language")
+            if val is not None:
+                language = val
+                continue
+
+            val = _parse_yaml_field(stripped, "return_type")
+            if val is not None:
+                return_type = val
+                continue
+
+            if stripped == "arguments:":
+                in_arguments = True
+                continue
+        else:
+            # End of arguments block: top-level non-indented key.
+            if not line.startswith(" ") and stripped and not stripped.startswith("-"):
+                break
+
+            if stripped.startswith("- name:"):
+                parts = stripped.split("  ")
+                arg: dict[str, str] = {"name": "", "type": "ANY", "mode": "IN"}
+                for part in parts:
+                    part = part.strip().lstrip("- ")
+                    if part.startswith("name:"):
+                        arg["name"] = part[len("name:"):].strip()
+                    elif part.startswith("type:"):
+                        arg["type"] = part[len("type:"):].strip()
+                    elif part.startswith("mode:"):
+                        arg["mode"] = part[len("mode:"):].strip()
+                arguments.append(arg)
+
+    return RoutineModelUpdate(
+        name=name,
+        description=description,
+        language=language,
+        arguments=arguments,
+        return_type=return_type,
     )
