@@ -192,15 +192,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="SQL files to validate (default: auto-discover all).",
     )
     check_parser.add_argument(
-        "--since",
-        type=float,
-        default=None,
-        help=(
-            "Use mtime-based detection: only check files modified "
-            "within the given number of hours."
-        ),
-    )
-    check_parser.add_argument(
         "--config",
         type=str,
         default=None,
@@ -488,12 +479,6 @@ def _handle_check(args: argparse.Namespace) -> None:
     # Determine files to check.
     if args.paths:
         files = [Path(p).resolve() for p in args.paths]
-    elif args.since is not None:
-        import time
-
-        cutoff = time.time() - args.since * 3600
-        all_files = discover_sql_files(output_root)
-        files = [f for f in all_files if f.stat().st_mtime >= cutoff]
     else:
         files = discover_sql_files(output_root)
 
