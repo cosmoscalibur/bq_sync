@@ -9,14 +9,19 @@ import pytest
 
 from bq_sync.sql_check import (
     CheckSummary,
+    _find_routine_model_yaml,
     _is_js_routine,
     _map_bq_type,
+    _parse_routine_model_yaml,
     _parse_yaml_name,
     _parse_yaml_schema,
     _strip_header,
     build_catalog,
     check_file,
     check_files,
+    check_js_contract,
+    check_js_routine,
+    check_js_syntax,
     check_lineage,
     check_references,
     check_syntax,
@@ -98,7 +103,35 @@ def tmp_project(tmp_path: Path) -> Path:
             -- Routine: transform
             -- Language: JAVASCRIPT
 
-            return x + 1;
+            function transform(x) {
+              return x * 2;
+            }
+        """),
+        encoding="utf-8",
+    )
+
+    (routines_dir / "broken_js.sql").write_text(
+        textwrap.dedent("""\
+            -- Routine: broken_js
+            -- Language: JAVASCRIPT
+
+            function bad(x { return x; }
+        """),
+        encoding="utf-8",
+    )
+
+    # Routine model YAML.
+    routine_models_dir = routines_dir / "models"
+    routine_models_dir.mkdir(parents=True)
+
+    (routine_models_dir / "transform.yaml").write_text(
+        textwrap.dedent("""\
+            name: transform
+            description: "Transforms input"
+            language: JAVASCRIPT
+            return_type: FLOAT64
+            arguments:
+              - name: x  type: FLOAT64  mode: IN
         """),
         encoding="utf-8",
     )
@@ -386,15 +419,28 @@ class TestCheckFile:
         assert result.level == "error"
         assert len(result.errors) >= 1
 
-    def test_js_routine_skipped(self, tmp_project: Path) -> None:
+    def test_js_routine_validated(self, tmp_project: Path) -> None:
+        """JS routines are now validated, not skipped."""
         sql_path = (
             tmp_project / "my_dataset" / "routines" / "transform.sql"
         )
         result = check_file(
             sql_path, tmp_project, "my_project"
         )
-        assert result.level == "info"
-        assert any("JavaScript" in m for m in result.info)
+        # Valid JS with matching contract → no error.
+        assert result.level != "error", (
+            f"Valid JS routine should not error: {result.errors}"
+        )
+
+    def test_broken_js_routine(self, tmp_project: Path) -> None:
+        sql_path = (
+            tmp_project / "my_dataset" / "routines" / "broken_js.sql"
+        )
+        result = check_file(
+            sql_path, tmp_project, "my_project"
+        )
+        assert result.level == "error"
+        assert len(result.errors) >= 1
 
     def test_procedural_routine(self, tmp_project: Path) -> None:
         sql_path = (
@@ -464,7 +510,258 @@ class TestDiscoverSqlFiles:
         assert "broken.sql" in names
         assert "calc.sql" in names
         assert "transform.sql" in names
+        assert "broken_js.sql" in names
         assert "monthly.sql" in names
 
     def test_empty_dir(self, tmp_path: Path) -> None:
         assert discover_sql_files(tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
+# Routine model YAML tests
+# ---------------------------------------------------------------------------
+
+
+class TestParseRoutineModelYaml:
+    """Tests for ``_parse_routine_model_yaml``."""
+
+    def test_full_model(self) -> None:
+        yaml = textwrap.dedent("""\
+            name: transform
+            description: "Transforms input"
+            language: JAVASCRIPT
+            return_type: FLOAT64
+            arguments:
+              - name: x  type: FLOAT64  mode: IN
+              - name: y  type: STRING  mode: IN
+        """)
+        model = _parse_routine_model_yaml(yaml)
+        assert model["return_type"] == "FLOAT64"
+        assert len(model["arguments"]) == 2
+        assert model["arguments"][0] == {"name": "x", "type": "FLOAT64"}
+        assert model["arguments"][1] == {"name": "y", "type": "STRING"}
+
+    def test_no_return_type(self) -> None:
+        yaml = textwrap.dedent("""\
+            name: proc
+            language: JAVASCRIPT
+            arguments:
+              - name: x  type: INT64  mode: IN
+        """)
+        model = _parse_routine_model_yaml(yaml)
+        assert model["return_type"] is None
+        assert len(model["arguments"]) == 1
+
+    def test_no_arguments(self) -> None:
+        yaml = textwrap.dedent("""\
+            name: noargs
+            language: JAVASCRIPT
+            return_type: STRING
+        """)
+        model = _parse_routine_model_yaml(yaml)
+        assert model["return_type"] == "STRING"
+        assert model["arguments"] == []
+
+    def test_empty_yaml(self) -> None:
+        model = _parse_routine_model_yaml("")
+        assert model["return_type"] is None
+        assert model["arguments"] == []
+
+
+class TestFindRoutineModelYaml:
+    """Tests for ``_find_routine_model_yaml``."""
+
+    def test_finds_existing_model(self, tmp_project: Path) -> None:
+        sql_path = (
+            tmp_project / "my_dataset" / "routines" / "transform.sql"
+        )
+        yaml_path = _find_routine_model_yaml(sql_path)
+        assert yaml_path is not None
+        assert yaml_path.name == "transform.yaml"
+
+    def test_returns_none_for_missing(self, tmp_project: Path) -> None:
+        sql_path = (
+            tmp_project / "my_dataset" / "routines" / "nonexistent.sql"
+        )
+        assert _find_routine_model_yaml(sql_path) is None
+
+
+# ---------------------------------------------------------------------------
+# JavaScript validation tests
+# ---------------------------------------------------------------------------
+
+
+class TestCheckJsSyntax:
+    """Tests for ``check_js_syntax``."""
+
+    def test_valid_function(self, tmp_path: Path) -> None:
+        js = "function f(x, y) { return x * y; }"
+        result = check_js_syntax(js, tmp_path / "test.sql")
+        assert result.level != "error"
+        assert result.errors == []
+
+    def test_valid_bare_return(self, tmp_path: Path) -> None:
+        """BQ JS UDFs can use bare return (no function wrapper)."""
+        js = "return x + y;"
+        result = check_js_syntax(js, tmp_path / "test.sql")
+        assert result.level != "error"
+
+    def test_valid_arrow_function(self, tmp_path: Path) -> None:
+        js = "const double = (x) => x * 2;"
+        result = check_js_syntax(js, tmp_path / "test.sql")
+        assert result.level != "error"
+
+    def test_valid_multiline(self, tmp_path: Path) -> None:
+        js = textwrap.dedent("""\
+            function transform(x) {
+              var result = x * 2;
+              if (result > 100) {
+                result = 100;
+              }
+              return result;
+            }
+        """)
+        result = check_js_syntax(js, tmp_path / "test.sql")
+        assert result.level != "error"
+
+    def test_missing_paren(self, tmp_path: Path) -> None:
+        js = "function f(x { return x; }"
+        result = check_js_syntax(js, tmp_path / "bad.sql")
+        assert result.level == "error"
+        assert len(result.errors) >= 1
+
+    def test_unexpected_token(self, tmp_path: Path) -> None:
+        js = "function f() { return +++; }"
+        result = check_js_syntax(js, tmp_path / "bad.sql")
+        assert result.level == "error"
+
+    def test_empty_body(self, tmp_path: Path) -> None:
+        js = ""
+        result = check_js_syntax(js, tmp_path / "empty.sql")
+        assert result.level != "error"
+
+    def test_error_has_line_info(self, tmp_path: Path) -> None:
+        js = "function f(x {\n  return x;\n}"
+        result = check_js_syntax(js, tmp_path / "bad.sql")
+        assert result.level == "error"
+        assert any("[line" in e for e in result.errors)
+
+
+class TestCheckJsContract:
+    """Tests for ``check_js_contract``."""
+
+    def test_matching_contract(self, tmp_path: Path) -> None:
+        """No warnings when function params match YAML args."""
+        js = "function transform(x) { return x * 2; }"
+        yaml_path = tmp_path / "model.yaml"
+        yaml_path.write_text(
+            textwrap.dedent("""\
+                name: transform
+                return_type: FLOAT64
+                arguments:
+                  - name: x  type: FLOAT64  mode: IN
+            """),
+            encoding="utf-8",
+        )
+        result = check_js_contract(js, tmp_path / "t.sql", yaml_path)
+        assert result.level != "warning"
+        assert result.warnings == []
+
+    def test_missing_return_statement(self, tmp_path: Path) -> None:
+        """Warn if return_type is set but body has no return."""
+        js = "var x = 42;"
+        yaml_path = tmp_path / "model.yaml"
+        yaml_path.write_text(
+            textwrap.dedent("""\
+                name: test
+                return_type: FLOAT64
+            """),
+            encoding="utf-8",
+        )
+        result = check_js_contract(js, tmp_path / "t.sql", yaml_path)
+        assert result.level == "warning"
+        assert any("return" in w.lower() for w in result.warnings)
+
+    def test_arg_count_mismatch(self, tmp_path: Path) -> None:
+        """Warn if JS function param count differs from YAML args."""
+        js = "function f(a, b, c) { return a + b + c; }"
+        yaml_path = tmp_path / "model.yaml"
+        yaml_path.write_text(
+            textwrap.dedent("""\
+                name: f
+                return_type: FLOAT64
+                arguments:
+                  - name: a  type: FLOAT64  mode: IN
+                  - name: b  type: FLOAT64  mode: IN
+            """),
+            encoding="utf-8",
+        )
+        result = check_js_contract(js, tmp_path / "t.sql", yaml_path)
+        assert result.level == "warning"
+        assert any("argument" in w.lower() for w in result.warnings)
+
+    def test_bare_return_no_function(self, tmp_path: Path) -> None:
+        """Bare return with args — no param mismatch warning."""
+        js = "return x + y;"
+        yaml_path = tmp_path / "model.yaml"
+        yaml_path.write_text(
+            textwrap.dedent("""\
+                name: add
+                return_type: FLOAT64
+                arguments:
+                  - name: x  type: FLOAT64  mode: IN
+                  - name: y  type: FLOAT64  mode: IN
+            """),
+            encoding="utf-8",
+        )
+        result = check_js_contract(js, tmp_path / "t.sql", yaml_path)
+        # No function_declaration → arg count check is skipped.
+        assert not any("argument" in w.lower() for w in result.warnings)
+
+    def test_no_model_yaml(self, tmp_path: Path) -> None:
+        """No warnings if model YAML is absent."""
+        js = "function f(x) { return x; }"
+        result = check_js_contract(
+            js, tmp_path / "t.sql", model_yaml_path=None
+        )
+        assert result.level != "warning"
+
+    def test_no_return_type_no_warning(self, tmp_path: Path) -> None:
+        """No warning about missing return if return_type is unset."""
+        js = "console.log('hello');"
+        yaml_path = tmp_path / "model.yaml"
+        yaml_path.write_text(
+            textwrap.dedent("""\
+                name: side_effect
+                language: JAVASCRIPT
+            """),
+            encoding="utf-8",
+        )
+        result = check_js_contract(js, tmp_path / "t.sql", yaml_path)
+        assert not any("return" in w.lower() for w in result.warnings)
+
+
+class TestCheckJsRoutine:
+    """Tests for the ``check_js_routine`` orchestrator."""
+
+    def test_valid_routine(self, tmp_project: Path) -> None:
+        sql_path = (
+            tmp_project / "my_dataset" / "routines" / "transform.sql"
+        )
+        raw = sql_path.read_text(encoding="utf-8")
+        result = check_js_routine(raw, sql_path)
+        assert result.level != "error"
+
+    def test_broken_routine(self, tmp_project: Path) -> None:
+        sql_path = (
+            tmp_project / "my_dataset" / "routines" / "broken_js.sql"
+        )
+        raw = sql_path.read_text(encoding="utf-8")
+        result = check_js_routine(raw, sql_path)
+        assert result.level == "error"
+
+    def test_empty_body(self, tmp_path: Path) -> None:
+        raw = "-- Routine: empty\n-- Language: JAVASCRIPT\n\n"
+        result = check_js_routine(raw, tmp_path / "empty.sql")
+        assert result.level == "info"
+        assert any("empty" in m.lower() for m in result.info)
