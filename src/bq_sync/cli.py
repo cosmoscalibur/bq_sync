@@ -13,7 +13,7 @@ from bq_sync.pull import pull_project
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    """Build the argument parser with ``pull`` and ``push`` subcommands."""
+    """Build the argument parser with subcommands."""
     parser = argparse.ArgumentParser(
         prog="bq-sync",
         description="Sync BigQuery resources to a local directory.",
@@ -180,6 +180,33 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to bq_sync.toml (default: auto-discover from CWD).",
     )
 
+    # --- check ---
+    check_parser = subparsers.add_parser(
+        "check",
+        help="Validate SQL syntax, references, and column lineage.",
+    )
+    check_parser.add_argument(
+        "paths",
+        nargs="*",
+        default=[],
+        help="SQL files to validate (default: auto-discover all).",
+    )
+    check_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to bq_sync.toml (default: auto-discover from CWD).",
+    )
+    check_parser.add_argument(
+        "--online",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable BQ dry-run validation for JS routines. "
+            "Requires active GCP credentials."
+        ),
+    )
+
     # --- materialize ---
     mat_parser = subparsers.add_parser(
         "materialize",
@@ -235,15 +262,14 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "push":
         _handle_push(args)
-
-    if args.command == "pull":
+    elif args.command == "pull":
         _handle_pull(args)
-
-    if args.command == "fetch":
+    elif args.command == "fetch":
         _handle_fetch(args)
-
-    if args.command == "rm":
+    elif args.command == "rm":
         _handle_rm(args)
+    elif args.command == "check":
+        _handle_check(args)
 
     if args.command == "materialize":
         _handle_materialize(args)
@@ -496,3 +522,72 @@ def _handle_fetch(args: argparse.Namespace) -> None:
     logging.info("Fetching %s -> %s", args.model, dest)
     bq_client.fetch_table_to_file(project, dataset, model, dest, fmt=fmt)
     logging.info("Saved %s", dest)
+
+
+def _handle_check(args: argparse.Namespace) -> None:
+    """Handle the ``check`` subcommand.
+
+    Validates SQL files for syntax errors, unresolved table references,
+    and column lineage issues using ``inbq``.
+    """
+    from bq_sync.sql_check import (
+        CheckSummary,
+        check_files,
+        discover_sql_files,
+    )
+
+    config_path, config = _resolve_config(args)
+    output_root = resolve_output_dir(config, config_path)
+    project = config.project.id
+
+    # Determine files to check.
+    if args.paths:
+        files = [Path(p).resolve() for p in args.paths]
+    else:
+        files = discover_sql_files(output_root)
+
+    if not files:
+        logging.info("No SQL files to validate.")
+        return
+
+    logging.info("Validating %d SQL file(s)...\n", len(files))
+
+    summary: CheckSummary = check_files(
+        files, output_root, project, online=args.online
+    )
+
+    # Pretty-print results.
+    for result in summary.results:
+        rel = result.path.name
+        try:
+            rel = str(result.path.relative_to(output_root))
+        except ValueError:
+            pass
+
+        if result.level == "error":
+            icon = "\u2717"  # ✗
+        elif result.level == "warning":
+            icon = "\u2713"  # ✓ (with warnings below)
+        else:
+            icon = "\u2713"  # ✓
+
+        print(f"  {icon} {rel}")
+
+        for table in result.tables_resolved:
+            print(f"      Tables: {table} \u2713")
+        for err in result.errors:
+            print(f"      {err}")
+        for warn in result.warnings:
+            print(f"      \u26a0 {warn}")
+        for info_msg in result.info:
+            print(f"      \u24d8 {info_msg}")
+
+    # Summary line.
+    print(
+        f"\n  {summary.failed} error(s), "
+        f"{summary.warned} warning(s), "
+        f"{summary.passed} passed"
+    )
+
+    if summary.failed > 0:
+        sys.exit(1)
