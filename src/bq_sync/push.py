@@ -22,6 +22,7 @@ from bq_sync import bq_client
 from bq_sync.config import SyncConfig, resolve_output_dir
 from bq_sync.readers import (
     read_model_yaml,
+    read_routine_model_yaml,
     read_routine_sql,
     read_saved_query_sql,
     read_view_model_yaml,
@@ -130,12 +131,12 @@ def _push_file(
 
     if resource_type == _VIEW_DIR and file.suffix == ".sql":
         update = read_view_sql(file)
-        bq_client.update_view(project, dataset, update.name, update.sql)
+        bq_client.upsert_view(project, dataset, update.name, update.sql)
 
     elif resource_type == _VIEW_DIR and file.suffix == ".yaml":
-        # View model YAML — push descriptions via the models dir.
+        # View model YAML — push descriptions.
         update = read_view_model_yaml(file)
-        bq_client.update_table_description(
+        bq_client.upsert_table_description(
             project,
             dataset,
             update.name,
@@ -145,7 +146,7 @@ def _push_file(
 
     elif resource_type == _MODEL_DIR and file.suffix == ".yaml":
         update = read_model_yaml(file)
-        bq_client.update_table_description(
+        bq_client.upsert_table_description(
             project,
             dataset,
             update.name,
@@ -155,17 +156,31 @@ def _push_file(
 
     elif resource_type == _ROUTINE_DIR and file.suffix == ".sql":
         update = read_routine_sql(file)
-        bq_client.update_routine(project, dataset, update.name, update.body)
+        # On the create-fallback path, arguments and return_type are needed.
+        # Attempt to read the companion model YAML when it exists.
+        model_yaml = output_root / dataset / _MODEL_DIR / f"{name}.yaml"
+        routine_model = (
+            read_routine_model_yaml(model_yaml) if model_yaml.is_file() else None
+        )
+        bq_client.upsert_routine(
+            project,
+            dataset,
+            update.name,
+            update.body,
+            language=update.language,
+            arguments=routine_model.arguments if routine_model else None,
+            return_type=routine_model.return_type if routine_model else None,
+        )
 
     elif resource_type == _ROUTINE_DIR and file.suffix == ".yaml":
         update = read_model_yaml(file)
-        bq_client.update_routine_description(
+        bq_client.upsert_routine_description(
             project, dataset, update.name, update.description
         )
 
     elif resource_type == _SAVED_QUERY_DIR and file.suffix == ".sql":
         update = read_saved_query_sql(file)
-        bq_client.update_saved_query(project, region, update.name, update.sql)
+        bq_client.upsert_saved_query(project, region, update.name, update.sql)
 
     else:
         logger.warning("Unsupported resource type/extension, skipping: %s", file)

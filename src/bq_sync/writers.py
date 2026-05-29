@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from pathlib import Path
 
 from bq_sync.humanize import humanize_bytes
@@ -19,6 +20,16 @@ from bq_sync.resources import (
 def _ensure_parent(path: Path) -> None:
     """Create parent directories if they do not exist."""
     path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _normalize_text(s: str) -> str:
+    """Normalize Unicode text to NFC (composed) form.
+
+    BigQuery SDK may return accented strings in NFD (decomposed) form.
+    Storing always as NFC guarantees identical bytes on every pull,
+    preventing spurious ``git diff`` hits for descriptions with accents.
+    """
+    return unicodedata.normalize("NFC", s)
 
 
 def _load_existing_descriptions(path: Path) -> tuple[str | None, dict[str, str]]:
@@ -40,7 +51,8 @@ def _load_existing_descriptions(path: Path) -> tuple[str | None, dict[str, str]]
     if not path.is_file():
         return None, {}
 
-    text = path.read_text(encoding="utf-8")
+    # Normalize on read-back so merge comparisons are NFC vs NFC.
+    text = _normalize_text(path.read_text(encoding="utf-8"))
 
     # --- top-level description ---
     model_desc: str | None = None
@@ -95,7 +107,7 @@ def _merge_description(
     bq_desc: str,
     local_desc: str | None,
 ) -> str:
-    """Return the description to write, preferring local over BQ.
+    """Return the NFC-normalized description to write, preferring local over BQ.
 
     Args:
         bq_desc: Description fetched from BigQuery.
@@ -103,10 +115,11 @@ def _merge_description(
 
     Returns:
         The local description when non-empty, otherwise the BQ value.
+        Always returned in NFC Unicode form.
     """
-    if local_desc:
-        return local_desc
-    return bq_desc
+    # Normalize both sides so the choice is always between NFC strings.
+    chosen = local_desc if local_desc else bq_desc
+    return _normalize_text(chosen)
 
 
 def _merge_field_descriptions(
@@ -139,7 +152,7 @@ def write_view_sql(path: Path, view: ViewInfo) -> None:
         view: View resource to write.
     """
     _ensure_parent(path)
-    path.write_text(view.sql, encoding="utf-8")
+    path.write_text(_normalize_text(view.sql), encoding="utf-8")
 
 
 def write_routine_sql(path: Path, routine: RoutineInfo) -> None:
@@ -151,7 +164,7 @@ def write_routine_sql(path: Path, routine: RoutineInfo) -> None:
     """
     _ensure_parent(path)
     header = f"-- Routine: {routine.name}\n-- Language: {routine.language}\n\n"
-    path.write_text(header + routine.sql, encoding="utf-8")
+    path.write_text(header + _normalize_text(routine.sql), encoding="utf-8")
 
 
 def write_scheduled_query_sql(path: Path, sq: ScheduledQueryInfo) -> None:
@@ -163,7 +176,7 @@ def write_scheduled_query_sql(path: Path, sq: ScheduledQueryInfo) -> None:
     """
     _ensure_parent(path)
     header = f"-- Scheduled Query: {sq.name}\n-- Schedule: {sq.schedule}\n\n"
-    path.write_text(header + sq.sql, encoding="utf-8")
+    path.write_text(header + _normalize_text(sq.sql), encoding="utf-8")
 
 
 def _format_schema_lines(schema: list[dict[str, str]]) -> list[str]:
@@ -180,7 +193,8 @@ def _format_schema_lines(schema: list[dict[str, str]]) -> list[str]:
     """
     lines = ["schema:"]
     for field in schema:
-        desc = field.get("description", "")
+        # Normalize field descriptions to NFC before serialising.
+        desc = _normalize_text(field.get("description", ""))
         desc_json = json.dumps(desc, ensure_ascii=False)
         entry = (
             f"  - name: {field['name']}  type: {field['type']}"
@@ -350,4 +364,4 @@ def write_saved_query_sql(path: Path, saved: SavedQueryInfo) -> None:
     """
     _ensure_parent(path)
     header = f"-- Saved Query: {saved.name}\n\n"
-    path.write_text(header + saved.sql, encoding="utf-8")
+    path.write_text(header + _normalize_text(saved.sql), encoding="utf-8")

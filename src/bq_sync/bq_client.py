@@ -6,10 +6,12 @@ Returns ``resources.*Info`` dataclass instances.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
 from google.api_core import client_options as client_options_lib
+from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
 from google.cloud import bigquery_datatransfer_v1 as datatransfer
 from google.cloud import dataform_v1beta1 as dataform
@@ -713,3 +715,330 @@ def delete_saved_query(project: str, region: str, name: str) -> None:
 
     client.delete_repository(name=target_repo.name, force=True)
     logger.info("Deleted saved query '%s'", name)
+
+
+# ---------------------------------------------------------------------------
+# Create functions (new resource path)
+# ---------------------------------------------------------------------------
+
+
+def create_view(project: str, dataset: str, name: str, sql: str) -> None:
+    """Create a new BigQuery view.
+
+    Args:
+        project: GCP project ID.
+        dataset: BigQuery dataset ID.
+        name: View name.
+        sql: SQL query defining the view.
+    """
+    client = bigquery.Client(project=project)
+    table_ref = f"{project}.{dataset}.{name}"
+    table = bigquery.Table(table_ref)
+    table.view_query = sql
+    client.create_table(table)
+    logger.info("Created view %s.%s.%s", project, dataset, name)
+
+
+def create_routine(
+    project: str,
+    dataset: str,
+    name: str,
+    body: str,
+    language: str = "SQL",
+    arguments: list[dict[str, str]] | None = None,
+    return_type: str | None = None,
+) -> None:
+    """Create a new BigQuery routine (function or procedure).
+
+    Args:
+        project: GCP project ID.
+        dataset: BigQuery dataset ID.
+        name: Routine name.
+        body: Routine body (SQL or JS code).
+        language: ``"SQL"`` or ``"JAVASCRIPT"``.
+        arguments: List of arg dicts with ``name``, ``type``, ``mode``.
+        return_type: Return type kind string (e.g. ``"INT64"``), or ``None``.
+    """
+    client = bigquery.Client(project=project)
+    routine_ref = bigquery.RoutineReference.from_string(
+        f"{project}.{dataset}.{name}"
+    )
+    routine = bigquery.Routine(routine_ref)
+    routine.body = body
+    routine.language = language
+
+    if arguments:
+        bq_args = []
+        for arg in arguments:
+            type_str = arg.get("type", "ANY")
+            # Convert string type name to SDK enum; fall back to UNSPECIFIED.
+            try:
+                type_kind = bigquery.enums.StandardSqlTypeKind[type_str]
+            except (KeyError, AttributeError):
+                type_kind = bigquery.enums.StandardSqlTypeKind.TYPE_KIND_UNSPECIFIED
+            data_type = bigquery.StandardSqlDataType(type_kind=type_kind)
+            bq_args.append(
+                bigquery.RoutineArgument(
+                    name=arg.get("name", ""),
+                    data_type=data_type,
+                )
+            )
+        routine.arguments = bq_args
+
+    if return_type:
+        try:
+            type_kind = bigquery.enums.StandardSqlTypeKind[return_type]
+        except (KeyError, AttributeError):
+            type_kind = bigquery.enums.StandardSqlTypeKind.TYPE_KIND_UNSPECIFIED
+        routine.return_type = bigquery.StandardSqlDataType(type_kind=type_kind)
+
+    client.create_routine(routine)
+    logger.info("Created routine %s.%s.%s", project, dataset, name)
+
+
+def create_saved_query(project: str, region: str, name: str, sql: str) -> None:
+    """Create a new saved query via Dataform API.
+
+    Creates a Dataform repository (display_name = *name*), a default
+    workspace inside it, and writes *sql* to ``content.sql``.
+
+    Args:
+        project: GCP project ID.
+        region: GCP region (e.g. ``us-east1``).
+        name: Saved query display name.
+        sql: SQL content.
+    """
+    options = client_options_lib.ClientOptions(quota_project_id=project)
+    client = dataform.DataformClient(client_options=options)
+    parent = f"projects/{project}/locations/{region}"
+
+    # Repository IDs must be URL-safe (lowercase, hyphens only).
+    repo_id = re.sub(r"[^a-z0-9-]", "-", name.lower())
+
+    repo = client.create_repository(
+        parent=parent,
+        repository=dataform.Repository(display_name=name),
+        repository_id=repo_id,
+    )
+    ws = client.create_workspace(
+        parent=repo.name,
+        workspace=dataform.Workspace(),
+        workspace_id="default",
+    )
+    client.write_file(
+        request={
+            "workspace": ws.name,
+            "path": "content.sql",
+            "contents": sql.encode(),
+        },
+    )
+    logger.info("Created saved query '%s'", name)
+
+
+# ---------------------------------------------------------------------------
+# Upsert helpers (update-first, create on NotFound)
+# ---------------------------------------------------------------------------
+
+
+def upsert_view(project: str, dataset: str, name: str, sql: str) -> None:
+    """Update or create a BigQuery view.
+
+    Tries ``update_view`` first (common path: one BQ call).  Falls back
+    to ``create_view`` when the resource does not yet exist.
+
+    Args:
+        project: GCP project ID.
+        dataset: BigQuery dataset ID.
+        name: View name.
+        sql: SQL query defining the view.
+    """
+    try:
+        update_view(project, dataset, name, sql)
+    except NotFound:
+        logger.info("View %s.%s.%s not found — creating.", project, dataset, name)
+        create_view(project, dataset, name, sql)
+
+
+def upsert_table_description(
+    project: str,
+    dataset: str,
+    name: str,
+    description: str,
+    field_descriptions: dict[str, str] | None = None,
+) -> None:
+    """Update a table/view description; warn and skip when absent.
+
+    A model YAML carries only metadata — there is no data source from
+    which to create a bare table.  When the target does not exist,
+    we log a warning and skip rather than error.
+
+    Args:
+        project: GCP project ID.
+        dataset: BigQuery dataset ID.
+        name: Table or view name.
+        description: New top-level description.
+        field_descriptions: Mapping of field name → description.
+    """
+    try:
+        update_table_description(
+            project, dataset, name, description, field_descriptions
+        )
+    except NotFound:
+        logger.warning(
+            "Table %s.%s.%s not found; skipping description push. "
+            "Create or materialize the table first, then push its model YAML.",
+            project,
+            dataset,
+            name,
+        )
+
+
+def upsert_routine(
+    project: str,
+    dataset: str,
+    name: str,
+    body: str,
+    language: str = "SQL",
+    arguments: list[dict[str, str]] | None = None,
+    return_type: str | None = None,
+) -> None:
+    """Update or create a BigQuery routine.
+
+    Tries ``update_routine`` first.  Falls back to ``create_routine``
+    (with full signature) when the routine is absent.
+
+    Args:
+        project: GCP project ID.
+        dataset: BigQuery dataset ID.
+        name: Routine name.
+        body: Routine body.
+        language: ``"SQL"`` or ``"JAVASCRIPT"``.
+        arguments: Arg dicts (used only on the create path).
+        return_type: Return type kind string (used only on the create path).
+    """
+    try:
+        update_routine(project, dataset, name, body)
+    except NotFound:
+        logger.info(
+            "Routine %s.%s.%s not found — creating.", project, dataset, name
+        )
+        create_routine(project, dataset, name, body, language, arguments, return_type)
+
+
+def upsert_routine_description(
+    project: str,
+    dataset: str,
+    name: str,
+    description: str,
+) -> None:
+    """Update routine description; warn and skip when routine absent.
+
+    Args:
+        project: GCP project ID.
+        dataset: BigQuery dataset ID.
+        name: Routine name.
+        description: New description.
+    """
+    try:
+        update_routine_description(project, dataset, name, description)
+    except NotFound:
+        logger.warning(
+            "Routine %s.%s.%s not found; skipping description push.",
+            project,
+            dataset,
+            name,
+        )
+
+
+def upsert_saved_query(project: str, region: str, name: str, sql: str) -> None:
+    """Update or create a saved query.
+
+    ``update_saved_query`` raises ``ValueError`` (not ``NotFound``) when
+    the query does not exist, so we catch that instead.
+
+    Args:
+        project: GCP project ID.
+        region: GCP region.
+        name: Saved query display name.
+        sql: SQL content.
+    """
+    try:
+        update_saved_query(project, region, name, sql)
+    except ValueError:
+        # update_saved_query raises ValueError when the repo is not found.
+        logger.info("Saved query '%s' not found — creating.", name)
+        create_saved_query(project, region, name, sql)
+
+
+# ---------------------------------------------------------------------------
+# Generic DDL execution + single-table fetch (used by materialize)
+# ---------------------------------------------------------------------------
+
+
+def run_query(project: str, sql: str, location: str | None = None) -> None:
+    """Execute a SQL statement (DDL or DML) on BigQuery.
+
+    Blocks until the job completes.  Raises on job errors.
+
+    Args:
+        project: GCP project ID.
+        sql: SQL to execute.
+        location: BQ processing location (e.g. ``"us-east1"`` or ``"US"``).
+            When ``None`` the client uses its default, which may differ
+            from the dataset location and cause a NotFound error.
+    """
+    client = bigquery.Client(project=project)
+    # Pass location explicitly so the job runs where the dataset lives,
+    # avoiding "not found in location US" when the dataset is in us-east1.
+    job = client.query(sql, location=location)
+    job.result()  # blocks; propagates any job error
+    logger.info("Executed query on project '%s'.", project)
+
+
+def get_table_info(project: str, dataset: str, name: str) -> TableInfo:
+    """Fetch metadata for a single BigQuery table.
+
+    Used after ``materialize`` to pull only the newly created table's
+    model YAML without scanning the entire dataset.
+
+    Args:
+        project: GCP project ID.
+        dataset: BigQuery dataset ID.
+        name: Table name.
+
+    Returns:
+        A ``TableInfo`` populated from the live BQ table.
+    """
+    client = bigquery.Client(project=project)
+    table_ref = f"{project}.{dataset}.{name}"
+    table = client.get_table(table_ref)
+    schema = [
+        {
+            "name": f.name,
+            "type": f.field_type,
+            "mode": f.mode,
+            "description": f.description or "",
+        }
+        for f in table.schema
+    ]
+    partitioning = None
+    if table.time_partitioning:
+        partitioning = table.time_partitioning.field or "ingestion_time"
+    clustering = list(table.clustering_fields) if table.clustering_fields else None
+    pk_columns: list[str] | None = None
+    constraints = getattr(table, "table_constraints", None)
+    if constraints and getattr(constraints, "primary_key", None):
+        pk_columns = list(constraints.primary_key.columns)
+    return TableInfo(
+        name=table.table_id,
+        schema=schema,
+        description=table.description or "",
+        row_count=table.num_rows or 0,
+        modified=table.modified or _EPOCH,
+        partitioning=partitioning,
+        clustering=clustering,
+        created=table.created,
+        region=table.location,
+        primary_keys=pk_columns,
+        total_logical_bytes=table.num_bytes,
+    )

@@ -594,3 +594,82 @@ class TestConfirm:
         monkeypatch.setattr("builtins.input", raise_eof)
 
         assert _confirm("Proceed?") is False
+
+
+# ---------------------------------------------------------------------------
+# Upsert path verification
+# ---------------------------------------------------------------------------
+
+
+class TestPushFileUsesUpsert:
+    """Verify that _push_file dispatches to upsert_* not update_*."""
+
+    def test_view_sql_calls_upsert_view(self, tmp_path: Path) -> None:
+        """Pushing a view SQL file calls upsert_view."""
+        from bq_sync.push import _push_file
+
+        output_root = _make_output_tree(tmp_path)
+        view = output_root / "my_dataset" / "views" / "active.sql"
+        view.write_text("SELECT 1")
+
+        with patch("bq_sync.push.bq_client") as mock_bq:
+            _push_file(view, output_root, "my-project", "us-east1")
+
+        mock_bq.upsert_view.assert_called_once()
+        # update_view must NOT be called directly from _push_file.
+        mock_bq.update_view.assert_not_called()
+
+    def test_model_yaml_calls_upsert_table_description(self, tmp_path: Path) -> None:
+        """Pushing a model YAML calls upsert_table_description."""
+        from bq_sync.push import _push_file
+
+        output_root = _make_output_tree(tmp_path)
+        model = output_root / "my_dataset" / "models" / "events.yaml"
+        model.write_text('name: events\ndescription: ""\nschema:\n')
+
+        with patch("bq_sync.push.bq_client") as mock_bq:
+            _push_file(model, output_root, "my-project", "us-east1")
+
+        mock_bq.upsert_table_description.assert_called_once()
+        mock_bq.update_table_description.assert_not_called()
+
+    def test_routine_sql_calls_upsert_routine(self, tmp_path: Path) -> None:
+        """Pushing a routine SQL file calls upsert_routine."""
+        from bq_sync.push import _push_file
+
+        output_root = _make_output_tree(tmp_path)
+        routine = output_root / "my_dataset" / "routines" / "fn.sql"
+        routine.write_text(
+            "-- Routine: fn\n-- Language: SQL\n\nRETURN 1;\n"
+        )
+
+        with patch("bq_sync.push.bq_client") as mock_bq:
+            _push_file(routine, output_root, "my-project", "us-east1")
+
+        mock_bq.upsert_routine.assert_called_once()
+        mock_bq.update_routine.assert_not_called()
+
+    def test_routine_sql_passes_model_yaml_args(self, tmp_path: Path) -> None:
+        """When a companion model YAML exists, its arguments are forwarded."""
+        from bq_sync.push import _push_file
+
+        output_root = _make_output_tree(tmp_path)
+        routine = output_root / "my_dataset" / "routines" / "fn.sql"
+        routine.write_text("-- Routine: fn\n-- Language: SQL\n\nRETURN x;\n")
+        # Write a companion model YAML with argument metadata.
+        model = output_root / "my_dataset" / "models" / "fn.yaml"
+        model.write_text(
+            'name: fn\ndescription: ""\nlanguage: SQL\n'
+            "return_type: INT64\n"
+            "arguments:\n  - name: x  type: INT64  mode: IN\n"
+        )
+
+        with patch("bq_sync.push.bq_client") as mock_bq:
+            _push_file(routine, output_root, "my-project", "us-east1")
+
+        call_kwargs = mock_bq.upsert_routine.call_args
+        # arguments and return_type are passed as keyword args.
+        assert call_kwargs.kwargs.get("return_type") == "INT64"
+        assert call_kwargs.kwargs.get("arguments") == [
+            {"name": "x", "type": "INT64", "mode": "IN"}
+        ]
