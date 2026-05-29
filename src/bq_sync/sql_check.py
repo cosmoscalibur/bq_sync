@@ -74,9 +74,12 @@ class CheckResult:
 class CheckSummary:
     """Aggregate results for a batch of checked files.
 
+    The three counters (``passed``, ``failed``, ``warned``) are
+    **disjoint**: every file falls into exactly one bucket.
+
     Attributes:
         results: Per-file results.
-        passed: Count of files without errors.
+        passed: Count of files without errors or warnings.
         failed: Count of files with errors.
         warned: Count of files with warnings but no errors.
     """
@@ -91,7 +94,7 @@ class CheckSummary:
 # Catalog builder
 # ---------------------------------------------------------------------------
 
-# Mapping from BQ types to inbq dtype strings.
+# Mapping from BQ scalar types to inbq dtype strings.
 _BQ_TYPE_MAP: dict[str, str] = {
     "STRING": "string",
     "BYTES": "bytes",
@@ -112,6 +115,36 @@ _BQ_TYPE_MAP: dict[str, str] = {
     "RECORD": "struct",
     "STRUCT": "struct",
 }
+
+# Regex to extract the base type from parameterized BQ types
+# like ARRAY<STRING>, STRUCT<x INT64>, ARRAY<STRUCT<...>>.
+_PARAMETERIZED_TYPE_RE = re.compile(r"^(ARRAY|STRUCT)\b", re.IGNORECASE)
+
+
+def _map_bq_type(bq_type: str) -> str:
+    """Map a BigQuery type string to an ``inbq`` dtype.
+
+    Handles both scalar types (via ``_BQ_TYPE_MAP``) and parameterized
+    types like ``ARRAY<STRING>`` or ``STRUCT<x INT64, y STRING>``.
+
+    Args:
+        bq_type: BigQuery type string (e.g. ``"INT64"``,
+            ``"ARRAY<STRING>"``).
+
+    Returns:
+        Corresponding ``inbq`` dtype string.
+    """
+    upper = bq_type.strip().upper()
+    # Direct scalar lookup.
+    if upper in _BQ_TYPE_MAP:
+        return _BQ_TYPE_MAP[upper]
+    # Parameterized types: extract the base type.
+    m = _PARAMETERIZED_TYPE_RE.match(upper)
+    if m:
+        base = m.group(1).upper()
+        return _BQ_TYPE_MAP.get(base, base.lower())
+    # Unknown type: pass through lowered.
+    return bq_type.lower()
 
 
 def _parse_yaml_schema(text: str) -> list[dict[str, str]]:
@@ -147,6 +180,8 @@ def _parse_yaml_schema(text: str) -> list[dict[str, str]]:
             name = ""
             dtype = ""
             for part in parts:
+                # Character-based strip: removes leading '-' and ' '.
+                # Safe because BQ column names start with [a-zA-Z_].
                 part = part.strip().lstrip("- ")
                 if part.startswith("name:"):
                     name = part[len("name:") :].strip()
@@ -203,8 +238,8 @@ def build_catalog(
             fqn = f"{project}.{dataset}.{table_name}"
             columns = []
             for f in schema_fields:
-                bq_type = f.get("type", "STRING").upper()
-                dtype = _BQ_TYPE_MAP.get(bq_type, bq_type.lower())
+                bq_type = f.get("type", "STRING")
+                dtype = _map_bq_type(bq_type)
                 columns.append({"name": f["name"], "dtype": dtype})
             schema_objects.append(
                 {
@@ -227,14 +262,20 @@ def build_catalog(
 
 
 def _strip_header(sql: str) -> str:
-    """Remove writer-generated comment headers from SQL text.
+    """Strip leading comment and blank lines from SQL text.
+
+    Removes **all** contiguous leading ``--`` comments and blank lines
+    until the first line of actual SQL.  This is broader than just
+    writer-generated headers (``-- Routine:``, ``-- Saved Query:``),
+    but is safe for validation because SQL parsers handle comments
+    correctly — the stripped lines carry no semantic value for
+    syntax, reference, or lineage analysis.
 
     Args:
         sql: Raw SQL file content.
 
     Returns:
-        SQL without leading ``-- Routine:``, ``-- Language:``,
-        ``-- Saved Query:`` headers.
+        SQL body without leading comments or blank lines.
     """
     lines = sql.splitlines()
     start = 0
@@ -247,25 +288,6 @@ def _strip_header(sql: str) -> str:
     return "\n".join(lines[start:])
 
 
-def _detect_resource_type(path: Path) -> str:
-    """Infer the resource type from a file's position in the tree.
-
-    Args:
-        path: Absolute file path.
-
-    Returns:
-        One of ``"view"``, ``"routine"``, ``"saved_query"``, or
-        ``"unknown"``.
-    """
-    parts = path.parts
-    for i, part in enumerate(parts):
-        if part == "views":
-            return "view"
-        if part == "routines":
-            return "routine"
-        if part == "saved_queries":
-            return "saved_query"
-    return "unknown"
 
 
 def _is_js_routine(sql: str) -> bool:
@@ -586,9 +608,9 @@ def check_files(
         result = check_file(f, output_root, project, catalog=catalog)
         results.append(result)
 
-    passed = sum(1 for r in results if r.level != "error")
     failed = sum(1 for r in results if r.level == "error")
     warned = sum(1 for r in results if r.level == "warning")
+    passed = len(results) - failed - warned
 
     return CheckSummary(
         results=results,

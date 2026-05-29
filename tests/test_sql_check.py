@@ -10,6 +10,7 @@ import pytest
 from bq_sync.sql_check import (
     CheckSummary,
     _is_js_routine,
+    _map_bq_type,
     _parse_yaml_name,
     _parse_yaml_schema,
     _strip_header,
@@ -201,6 +202,32 @@ class TestParseYamlName:
 
     def test_missing_name(self) -> None:
         assert _parse_yaml_name("description: foo\n") == ""
+
+
+class TestMapBqType:
+    """Tests for ``_map_bq_type``."""
+
+    def test_scalar_types(self) -> None:
+        assert _map_bq_type("STRING") == "string"
+        assert _map_bq_type("INT64") == "int64"
+        assert _map_bq_type("FLOAT64") == "float64"
+        assert _map_bq_type("BOOL") == "bool"
+
+    def test_case_insensitive(self) -> None:
+        assert _map_bq_type("string") == "string"
+        assert _map_bq_type("Int64") == "int64"
+
+    def test_array_type(self) -> None:
+        assert _map_bq_type("ARRAY<STRING>") == "array"
+
+    def test_struct_type(self) -> None:
+        assert _map_bq_type("STRUCT<x INT64, y STRING>") == "struct"
+
+    def test_nested_array_struct(self) -> None:
+        assert _map_bq_type("ARRAY<STRUCT<a INT64>>") == "array"
+
+    def test_unknown_passthrough(self) -> None:
+        assert _map_bq_type("INTERVAL") == "interval"
 
 
 # ---------------------------------------------------------------------------
@@ -401,11 +428,25 @@ class TestCheckFiles:
         assert isinstance(summary, CheckSummary)
         assert summary.failed >= 1
         assert summary.passed >= 1
+        # Disjoint: passed + failed + warned == total files.
+        assert (
+            summary.passed + summary.failed + summary.warned
+            == len(files)
+        )
 
     def test_empty_batch(self, tmp_project: Path) -> None:
         summary = check_files([], tmp_project, "my_project")
         assert summary.failed == 0
         assert summary.passed == 0
+        assert summary.warned == 0
+
+    def test_disjoint_counts(self, tmp_project: Path) -> None:
+        """Verify that passed, failed, warned are disjoint buckets."""
+        # 5 files: 1 broken (error), 1 JS skip (info), others (info/warn)
+        files = discover_sql_files(tmp_project)
+        summary = check_files(files, tmp_project, "my_project")
+        total = len(files)
+        assert summary.passed + summary.failed + summary.warned == total
 
 
 # ---------------------------------------------------------------------------

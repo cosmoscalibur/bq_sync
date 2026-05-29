@@ -225,17 +225,13 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "push":
         _handle_push(args)
-
-    if args.command == "pull":
+    elif args.command == "pull":
         _handle_pull(args)
-
-    if args.command == "fetch":
+    elif args.command == "fetch":
         _handle_fetch(args)
-
-    if args.command == "rm":
+    elif args.command == "rm":
         _handle_rm(args)
-
-    if args.command == "check":
+    elif args.command == "check":
         _handle_check(args)
 
 
