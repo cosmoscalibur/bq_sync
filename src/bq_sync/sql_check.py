@@ -1,13 +1,16 @@
-"""SQL syntax validation and lineage analysis for BigQuery resources.
+"""SQL and JavaScript validation for BigQuery resources.
 
 Uses ``inbq`` (Rust + PyO3) for parsing BigQuery SQL and extracting
-column-level lineage.  Three analysis levels are supported:
+column-level lineage, and ``tree-sitter`` for JavaScript UDF syntax
+validation.  Analysis levels:
 
-1. **Syntax** — parse SQL and report errors.
+1. **Syntax** — parse SQL/JS and report errors.
 2. **References** — extract referenced tables and verify against the
    local model catalog.
 3. **Lineage** — trace column-level data flow and report unresolvable
    columns.
+4. **Contract** (JS only) — verify return statements and argument
+   counts against the routine model YAML.
 
 This module is invoked by the ``bq-sync check`` CLI subcommand and is
 **not** coupled to the push workflow.
@@ -23,6 +26,14 @@ from typing import Literal
 
 import inbq
 import inbq.ast_nodes as ast_nodes
+from tree_sitter import Language, Parser
+
+try:
+    import tree_sitter_javascript as _tsjs
+
+    _JS_LANGUAGE = Language(_tsjs.language())
+except Exception:  # pragma: no cover – optional at import time
+    _JS_LANGUAGE = None
 
 logger = logging.getLogger(__name__)
 
@@ -297,12 +308,297 @@ def _is_js_routine(sql: str) -> bool:
         sql: Raw SQL file content.
 
     Returns:
-        Whether the file is a JS routine (should be skipped).
+        Whether the file is a JS routine.
     """
     m = _ROUTINE_HEADER_RE.search(sql)
     if m:
         return m.group(1).strip().upper() in ("JAVASCRIPT", "JS")
     return False
+
+
+# ---------------------------------------------------------------------------
+# Routine model YAML helpers
+# ---------------------------------------------------------------------------
+
+
+def _find_routine_model_yaml(sql_path: Path) -> Path | None:
+    """Locate the routine model YAML for a given routine SQL file.
+
+    Model YAMLs live in ``<dataset>/routines/models/<name>.yaml``.
+
+    Args:
+        sql_path: Absolute path to the routine ``.sql`` file.
+
+    Returns:
+        Path to the model YAML if it exists, ``None`` otherwise.
+    """
+    models_dir = sql_path.parent / "models"
+    yaml_path = models_dir / f"{sql_path.stem}.yaml"
+    if yaml_path.is_file():
+        return yaml_path
+    return None
+
+
+def _parse_routine_model_yaml(
+    text: str,
+) -> dict:
+    """Parse a routine model YAML into a metadata dict.
+
+    Extracts ``return_type`` and ``arguments`` from the format
+    produced by ``writers.write_routine_model_yaml``.
+
+    Args:
+        text: Full YAML file content.
+
+    Returns:
+        Dict with keys ``"return_type"`` (str or None) and
+        ``"arguments"`` (list of ``{"name": ..., "type": ...}``).
+    """
+    result: dict = {"return_type": None, "arguments": []}
+    in_arguments = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("return_type:"):
+            result["return_type"] = stripped[len("return_type:"):].strip()
+            continue
+        if stripped == "arguments:":
+            in_arguments = True
+            continue
+        if in_arguments:
+            if (
+                not line.startswith(" ")
+                and stripped
+                and not stripped.startswith("-")
+            ):
+                break
+            if stripped.startswith("- name:"):
+                parts = stripped.split("  ")
+                name = ""
+                dtype = ""
+                for part in parts:
+                    # Character-based strip: same as _parse_yaml_schema.
+                    part = part.strip().lstrip("- ")
+                    if part.startswith("name:"):
+                        name = part[len("name:"):].strip()
+                    elif part.startswith("type:"):
+                        dtype = part[len("type:"):].strip()
+                if name:
+                    result["arguments"].append(
+                        {"name": name, "type": dtype}
+                    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# JavaScript validation (tree-sitter)
+# ---------------------------------------------------------------------------
+
+
+def _walk_tree(node):
+    """Yield all nodes in a tree-sitter tree (pre-order DFS).
+
+    Args:
+        node: Root tree-sitter node.
+
+    Yields:
+        Each node in the tree.
+    """
+    yield node
+    for child in node.children:
+        yield from _walk_tree(child)
+
+
+def check_js_syntax(js_body: str, path: Path) -> CheckResult:
+    """Validate JavaScript syntax using tree-sitter.
+
+    Parses the JS body and searches for ``ERROR`` nodes in the
+    concrete syntax tree.  Tree-sitter always produces a tree
+    (even for invalid input), with errors as localized nodes.
+
+    Args:
+        js_body: JavaScript source code (header stripped).
+        path: File path for error reporting.
+
+    Returns:
+        ``CheckResult`` with syntax errors if any.
+    """
+    result = CheckResult(path=path)
+
+    if _JS_LANGUAGE is None:
+        result.info.append(
+            "tree-sitter-javascript not available; "
+            "JS syntax check skipped"
+        )
+        return result
+
+    parser = Parser(_JS_LANGUAGE)
+    tree = parser.parse(js_body.encode("utf-8"))
+
+    errors: list[str] = []
+    for node in _walk_tree(tree.root_node):
+        if node.type == "ERROR" or node.is_missing:
+            row = node.start_point.row + 1
+            col = node.start_point.column + 1
+            snippet = (
+                node.text.decode("utf-8", errors="replace")[:40]
+                if node.text
+                else ""
+            )
+            if node.is_missing:
+                errors.append(
+                    f"[line {row}, col {col}] "
+                    f"Missing expected token: {node.type}"
+                )
+            else:
+                errors.append(
+                    f"[line {row}, col {col}] "
+                    f"Syntax error near: {snippet!r}"
+                )
+
+    if errors:
+        result.errors = errors
+        result.level = "error"
+    else:
+        result.level = "info"
+
+    return result
+
+
+def check_js_contract(
+    js_body: str,
+    path: Path,
+    model_yaml_path: Path | None = None,
+) -> CheckResult:
+    """Validate the JS routine contract against its model YAML.
+
+    Checks:
+    - Whether the body contains a ``return`` statement (expected for
+      functions with a ``return_type``).
+    - Whether the number of function parameters matches the argument
+      count in the model YAML.
+
+    Args:
+        js_body: JavaScript source code (header stripped).
+        path: File path for error reporting.
+        model_yaml_path: Path to the routine model YAML (optional).
+
+    Returns:
+        ``CheckResult`` with contract warnings.
+    """
+    result = CheckResult(path=path)
+
+    if _JS_LANGUAGE is None:
+        return result
+
+    parser = Parser(_JS_LANGUAGE)
+    tree = parser.parse(js_body.encode("utf-8"))
+
+    # Detect return statements.
+    has_return = any(
+        node.type == "return_statement"
+        for node in _walk_tree(tree.root_node)
+    )
+
+    # Load model YAML if available.
+    model: dict | None = None
+    if model_yaml_path and model_yaml_path.is_file():
+        text = model_yaml_path.read_text(encoding="utf-8")
+        model = _parse_routine_model_yaml(text)
+
+    if model:
+        # Check return statement vs return_type.
+        if model.get("return_type") and not has_return:
+            result.warnings.append(
+                f"Routine declares return_type "
+                f"'{model['return_type']}' but JS body has no "
+                f"return statement"
+            )
+
+        # Check argument count (heuristic — BQ JS UDFs receive args
+        # as global variables, so function parameters are optional).
+        yaml_args = model.get("arguments", [])
+        func_nodes = [
+            n for n in _walk_tree(tree.root_node)
+            if n.type == "function_declaration"
+        ]
+        if func_nodes:
+            params_node = next(
+                (
+                    n
+                    for n in _walk_tree(func_nodes[0])
+                    if n.type == "formal_parameters"
+                ),
+                None,
+            )
+            if params_node:
+                js_params = [
+                    n
+                    for n in params_node.children
+                    if n.type == "identifier"
+                ]
+                if len(js_params) != len(yaml_args):
+                    result.warnings.append(
+                        f"YAML declares {len(yaml_args)} "
+                        f"argument(s) but JS function has "
+                        f"{len(js_params)} parameter(s)"
+                    )
+
+    if result.warnings:
+        result.level = "warning"
+    else:
+        result.level = "info"
+
+    return result
+
+
+def check_js_routine(
+    raw_sql: str,
+    path: Path,
+) -> CheckResult:
+    """Run all JS validation levels on a single routine file.
+
+    Combines syntax check and contract validation results.
+
+    Args:
+        raw_sql: Raw file content (with header).
+        path: Absolute path to the SQL file.
+
+    Returns:
+        Merged ``CheckResult``.
+    """
+    js_body = _strip_header(raw_sql)
+    if not js_body.strip():
+        return CheckResult(
+            path=path,
+            level="info",
+            info=["Skipped: empty JS routine body"],
+        )
+
+    # Level 1: JS Syntax.
+    syntax_result = check_js_syntax(js_body, path)
+    if syntax_result.errors:
+        return syntax_result
+
+    # Level 1.5: Contract validation.
+    model_path = _find_routine_model_yaml(path)
+    contract_result = check_js_contract(
+        js_body, path, model_yaml_path=model_path
+    )
+
+    # Merge results.
+    result = CheckResult(path=path)
+    result.info.extend(syntax_result.info)
+    result.warnings.extend(contract_result.warnings)
+    result.info.extend(contract_result.info)
+
+    if result.errors:
+        result.level = "error"
+    elif result.warnings:
+        result.level = "warning"
+    else:
+        result.level = "info"
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -547,13 +843,9 @@ def check_file(
     """
     raw_sql = path.read_text(encoding="utf-8")
 
-    # Skip JavaScript routines.
+    # JavaScript routines: validate with tree-sitter.
     if _is_js_routine(raw_sql):
-        return CheckResult(
-            path=path,
-            level="info",
-            info=["Skipped: JavaScript routine"],
-        )
+        return check_js_routine(raw_sql, path)
 
     sql = _strip_header(raw_sql)
     if not sql.strip():
