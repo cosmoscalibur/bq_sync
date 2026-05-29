@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import textwrap
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from bq_sync.sql_check import (
     CheckSummary,
+    _build_js_udf_query,
     _find_routine_model_yaml,
     _is_js_routine,
     _map_bq_type,
@@ -20,6 +22,7 @@ from bq_sync.sql_check import (
     check_file,
     check_files,
     check_js_contract,
+    check_js_dryrun,
     check_js_routine,
     check_js_syntax,
     check_lineage,
@@ -765,3 +768,184 @@ class TestCheckJsRoutine:
         result = check_js_routine(raw, tmp_path / "empty.sql")
         assert result.level == "info"
         assert any("empty" in m.lower() for m in result.info)
+
+
+# ---------------------------------------------------------------------------
+# Dry-run tests
+# ---------------------------------------------------------------------------
+
+
+class TestBuildJsUdfQuery:
+    """Tests for ``_build_js_udf_query``."""
+
+    def test_basic_query(self) -> None:
+        query = _build_js_udf_query(
+            name="double",
+            body="return x * 2;",
+            arguments=[{"name": "x", "type": "FLOAT64"}],
+            return_type="FLOAT64",
+        )
+        assert "CREATE TEMP FUNCTION `double`" in query
+        assert "x FLOAT64" in query
+        assert "RETURNS FLOAT64" in query
+        assert "LANGUAGE js" in query
+        assert "return x * 2;" in query
+        assert "SELECT `double`(NULL)" in query
+
+    def test_multiple_args(self) -> None:
+        query = _build_js_udf_query(
+            name="add",
+            body="return a + b;",
+            arguments=[
+                {"name": "a", "type": "FLOAT64"},
+                {"name": "b", "type": "FLOAT64"},
+            ],
+            return_type="FLOAT64",
+        )
+        assert "a FLOAT64, b FLOAT64" in query
+        assert "SELECT `add`(NULL, NULL)" in query
+
+    def test_no_args(self) -> None:
+        query = _build_js_udf_query(
+            name="hello",
+            body='return "hello";',
+            arguments=[],
+            return_type="STRING",
+        )
+        assert "`hello`()" in query
+        assert "SELECT `hello`()" in query
+
+
+class TestCheckJsDryrun:
+    """Tests for ``check_js_dryrun``."""
+
+    def test_no_model_yaml(self, tmp_path: Path) -> None:
+        """Dry-run is skipped if no model YAML is available."""
+        result = check_js_dryrun(
+            "return 1;", tmp_path / "t.sql", "proj",
+            model_yaml_path=None,
+        )
+        assert result.level != "error"
+        assert any("skipped" in m.lower() for m in result.info)
+
+    def test_no_return_type(self, tmp_path: Path) -> None:
+        """Dry-run is skipped if model has no return_type."""
+        yaml_path = tmp_path / "model.yaml"
+        yaml_path.write_text(
+            "name: proc\nlanguage: JAVASCRIPT\n",
+            encoding="utf-8",
+        )
+        result = check_js_dryrun(
+            "console.log(1);", tmp_path / "t.sql", "proj",
+            model_yaml_path=yaml_path,
+        )
+        assert any("return_type" in m for m in result.info)
+
+    def test_successful_dryrun(self, tmp_path: Path) -> None:
+        """Successful dry-run returns info OK."""
+        yaml_path = tmp_path / "model.yaml"
+        yaml_path.write_text(
+            textwrap.dedent("""\
+                name: double
+                return_type: FLOAT64
+                arguments:
+                  - name: x  type: FLOAT64  mode: IN
+            """),
+            encoding="utf-8",
+        )
+        # Mock the BQ client so no actual API call is made.
+        mock_client = MagicMock()
+        mock_client.query.return_value = MagicMock()
+        mock_bq = MagicMock()
+        mock_bq.Client.return_value = mock_client
+        mock_bq.QueryJobConfig.return_value = MagicMock()
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "google.cloud.bigquery": mock_bq,
+                "google.cloud": MagicMock(bigquery=mock_bq),
+            },
+        ):
+            result = check_js_dryrun(
+                "return x * 2;",
+                tmp_path / "double.sql",
+                "test-project",
+                model_yaml_path=yaml_path,
+            )
+        assert result.level != "error"
+        assert any("OK" in m for m in result.info)
+
+    def test_dryrun_api_error(self, tmp_path: Path) -> None:
+        """BQ API error is reported as a check error."""
+        yaml_path = tmp_path / "model.yaml"
+        yaml_path.write_text(
+            textwrap.dedent("""\
+                name: bad
+                return_type: FLOAT64
+                arguments:
+                  - name: x  type: FLOAT64  mode: IN
+            """),
+            encoding="utf-8",
+        )
+        mock_client = MagicMock()
+        mock_client.query.side_effect = Exception(
+            "Syntax error in JavaScript UDF"
+        )
+        mock_bq = MagicMock()
+        mock_bq.Client.return_value = mock_client
+        mock_bq.QueryJobConfig.return_value = MagicMock()
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "google.cloud.bigquery": mock_bq,
+                "google.cloud": MagicMock(bigquery=mock_bq),
+            },
+        ):
+            result = check_js_dryrun(
+                "function bad(x { return x; }",
+                tmp_path / "bad.sql",
+                "test-project",
+                model_yaml_path=yaml_path,
+            )
+        assert result.level == "error"
+        assert any("dry-run" in e.lower() for e in result.errors)
+
+
+class TestCheckJsRoutineOnline:
+    """Tests for ``check_js_routine`` with ``online=True``."""
+
+    def test_online_calls_dryrun(self, tmp_project: Path) -> None:
+        """When online=True, dry-run is invoked after local checks."""
+        sql_path = (
+            tmp_project / "my_dataset" / "routines" / "transform.sql"
+        )
+        raw = sql_path.read_text(encoding="utf-8")
+        with patch(
+            "bq_sync.sql_check.check_js_dryrun",
+        ) as mock_dryrun:
+            from bq_sync.sql_check import CheckResult
+
+            mock_dryrun.return_value = CheckResult(
+                path=sql_path,
+                level="info",
+                info=["Dry-run: OK"],
+            )
+            result = check_js_routine(
+                raw, sql_path, online=True, project="my_project"
+            )
+        mock_dryrun.assert_called_once()
+        assert result.level != "error"
+
+    def test_offline_skips_dryrun(self, tmp_project: Path) -> None:
+        """When online=False (default), dry-run is not invoked."""
+        sql_path = (
+            tmp_project / "my_dataset" / "routines" / "transform.sql"
+        )
+        raw = sql_path.read_text(encoding="utf-8")
+        with patch(
+            "bq_sync.sql_check.check_js_dryrun",
+        ) as mock_dryrun:
+            check_js_routine(raw, sql_path)
+        mock_dryrun.assert_not_called()
