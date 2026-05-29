@@ -11,6 +11,8 @@ validation.  Analysis levels:
    columns.
 4. **Contract** (JS only) — verify return statements and argument
    counts against the routine model YAML.
+5. **Dry-run** (JS, ``--online``) — end-to-end validation against the
+   BigQuery API.
 
 This module is invoked by the ``bq-sync check`` CLI subcommand and is
 **not** coupled to the push workflow.
@@ -551,17 +553,134 @@ def check_js_contract(
     return result
 
 
+# ---------------------------------------------------------------------------
+# Layer 2: BigQuery dry-run (--online)
+# ---------------------------------------------------------------------------
+
+
+def _build_js_udf_query(
+    name: str,
+    body: str,
+    arguments: list[dict],
+    return_type: str,
+) -> str:
+    """Build a ``CREATE TEMP FUNCTION`` query for dry-run validation.
+
+    Constructs a self-contained query that defines the JS UDF as a
+    temporary function and invokes it with NULL arguments, allowing
+    BigQuery to validate syntax, types, and argument bindings.
+
+    Args:
+        name: Routine name.
+        body: JavaScript source code.
+        arguments: List of ``{"name": ..., "type": ...}`` dicts.
+        return_type: BigQuery return type (e.g. ``"FLOAT64"``).
+
+    Returns:
+        SQL query string.
+    """
+    args_sql = ", ".join(
+        f"{a['name']} {a['type']}" for a in arguments
+    )
+    null_args = ", ".join("NULL" for _ in arguments)
+    return (
+        f"CREATE TEMP FUNCTION `{name}`({args_sql})\n"
+        f"RETURNS {return_type}\n"
+        f"LANGUAGE js\n"
+        f'AS r"""\n{body}\n""";\n'
+        f"SELECT `{name}`({null_args});\n"
+    )
+
+
+def check_js_dryrun(
+    js_body: str,
+    path: Path,
+    project: str,
+    model_yaml_path: Path | None = None,
+) -> CheckResult:
+    """Validate a JS routine via BigQuery dry-run.
+
+    Reconstructs the ``CREATE TEMP FUNCTION`` statement and executes
+    a dry-run query against the BigQuery API.  This validates syntax,
+    types, argument bindings, and return types end-to-end.
+
+    Requires active GCP credentials and network access.
+
+    Args:
+        js_body: JavaScript source code (header stripped).
+        path: File path for error reporting.
+        project: GCP project ID.
+        model_yaml_path: Path to the routine model YAML.
+
+    Returns:
+        ``CheckResult`` with errors from the BQ API if validation
+        fails.
+    """
+    result = CheckResult(path=path)
+
+    # Load model to get name, return_type, and arguments.
+    if not model_yaml_path or not model_yaml_path.is_file():
+        result.info.append(
+            "Dry-run skipped: no model YAML available for "
+            "routine reconstruction"
+        )
+        return result
+
+    text = model_yaml_path.read_text(encoding="utf-8")
+    model = _parse_routine_model_yaml(text)
+    name = _parse_yaml_name(text)
+
+    if not name:
+        result.info.append("Dry-run skipped: could not parse routine name")
+        return result
+
+    return_type = model.get("return_type")
+    if not return_type:
+        result.info.append(
+            "Dry-run skipped: no return_type in model YAML"
+        )
+        return result
+
+    arguments = model.get("arguments", [])
+    query = _build_js_udf_query(name, js_body, arguments, return_type)
+
+    try:
+        from google.cloud import bigquery
+
+        client = bigquery.Client(project=project)
+        job_config = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
+        client.query(query, job_config=job_config)
+        # No exception means the routine is valid.
+        result.info.append("Dry-run: OK")
+    except ImportError:
+        result.info.append(
+            "Dry-run skipped: google-cloud-bigquery not available"
+        )
+    except Exception as exc:  # noqa: BLE001
+        result.errors.append(f"Dry-run failed: {exc}")
+        result.level = "error"
+        return result
+
+    return result
+
+
 def check_js_routine(
     raw_sql: str,
     path: Path,
+    *,
+    online: bool = False,
+    project: str = "",
 ) -> CheckResult:
     """Run all JS validation levels on a single routine file.
 
-    Combines syntax check and contract validation results.
+    Combines syntax check, contract validation, and optionally
+    dry-run validation results.
 
     Args:
         raw_sql: Raw file content (with header).
         path: Absolute path to the SQL file.
+        online: If ``True``, run dry-run validation against BQ API.
+        project: GCP project ID (required when ``online`` is True).
 
     Returns:
         Merged ``CheckResult``.
@@ -590,6 +709,16 @@ def check_js_routine(
     result.info.extend(syntax_result.info)
     result.warnings.extend(contract_result.warnings)
     result.info.extend(contract_result.info)
+
+    # Layer 2: Dry-run (only if --online and no errors so far).
+    if online and not result.errors:
+        model_path = model_path  # reuse from contract step
+        dryrun_result = check_js_dryrun(
+            js_body, path, project, model_yaml_path=model_path
+        )
+        result.errors.extend(dryrun_result.errors)
+        result.warnings.extend(dryrun_result.warnings)
+        result.info.extend(dryrun_result.info)
 
     if result.errors:
         result.level = "error"
@@ -829,6 +958,8 @@ def check_file(
     output_root: Path,
     project: str,
     catalog: dict | None = None,
+    *,
+    online: bool = False,
 ) -> CheckResult:
     """Run all analysis levels on a single SQL file.
 
@@ -837,15 +968,18 @@ def check_file(
         output_root: Project-scoped output directory.
         project: GCP project ID.
         catalog: Pre-built catalog (built once for batch).
+        online: If ``True``, run BQ dry-run for JS routines.
 
     Returns:
         Merged ``CheckResult`` for the file.
     """
     raw_sql = path.read_text(encoding="utf-8")
 
-    # JavaScript routines: validate with tree-sitter.
+    # JavaScript routines: validate with tree-sitter (+ dry-run).
     if _is_js_routine(raw_sql):
-        return check_js_routine(raw_sql, path)
+        return check_js_routine(
+            raw_sql, path, online=online, project=project
+        )
 
     sql = _strip_header(raw_sql)
     if not sql.strip():
@@ -880,6 +1014,8 @@ def check_files(
     files: list[Path],
     output_root: Path,
     project: str,
+    *,
+    online: bool = False,
 ) -> CheckSummary:
     """Validate a batch of SQL files.
 
@@ -889,6 +1025,7 @@ def check_files(
         files: List of absolute paths to SQL files.
         output_root: Project-scoped output directory.
         project: GCP project ID.
+        online: If ``True``, run BQ dry-run for JS routines.
 
     Returns:
         ``CheckSummary`` with per-file results and counts.
@@ -897,7 +1034,9 @@ def check_files(
     results: list[CheckResult] = []
 
     for f in files:
-        result = check_file(f, output_root, project, catalog=catalog)
+        result = check_file(
+            f, output_root, project, catalog=catalog, online=online
+        )
         results.append(result)
 
     failed = sum(1 for r in results if r.level == "error")

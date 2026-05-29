@@ -197,6 +197,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to bq_sync.toml (default: auto-discover from CWD).",
     )
+    check_parser.add_argument(
+        "--online",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable BQ dry-run validation for JS routines. "
+            "Requires active GCP credentials."
+        ),
+    )
 
     return parser
 
@@ -488,7 +497,9 @@ def _handle_check(args: argparse.Namespace) -> None:
 
     logging.info("Validating %d SQL file(s)...\n", len(files))
 
-    summary: CheckSummary = check_files(files, output_root, project)
+    summary: CheckSummary = check_files(
+        files, output_root, project, online=args.online
+    )
 
     # Pretty-print results.
     for result in summary.results:
