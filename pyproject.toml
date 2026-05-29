@@ -15,6 +15,8 @@ dependencies = [
     "google-cloud-dataform",
     "inbq",
     "polars",
+    "tree-sitter",
+    "tree-sitter-javascript",
 ]
 
 [project.scripts]
