@@ -265,6 +265,146 @@ def list_scheduled_queries(project: str, region: str) -> list[ScheduledQueryInfo
     return configs
 
 
+# ---------------------------------------------------------------------------
+# DataTransfer helpers (reschedule command)
+# ---------------------------------------------------------------------------
+
+
+def list_transfer_configs(
+    project: str, region: str
+) -> list[datatransfer.TransferConfig]:
+    """List all scheduled-query transfer configs in a project/region.
+
+    Filters to ``data_source_id == "scheduled_query"`` so only
+    BigQuery scheduled queries are returned (not other transfer types).
+
+    Args:
+        project: GCP project ID.
+        region: GCP region (e.g. ``us-east1``).
+
+    Returns:
+        List of ``TransferConfig`` protobuf objects.
+    """
+    options = client_options_lib.ClientOptions(quota_project_id=project)
+    client = datatransfer.DataTransferServiceClient(client_options=options)
+    parent = f"projects/{project}/locations/{region}"
+
+    return [
+        tc
+        for tc in client.list_transfer_configs(parent=parent)
+        if tc.data_source_id == "scheduled_query"
+    ]
+
+
+def get_transfer_config(
+    project: str,
+    region: str,
+    display_name: str,
+) -> datatransfer.TransferConfig | None:
+    """Find a scheduled-query transfer config by exact display name.
+
+    Scans all configs via ``list_transfer_configs`` and returns the
+    first match.  Returns ``None`` when no config matches.
+
+    Args:
+        project: GCP project ID.
+        region: GCP region (e.g. ``us-east1``).
+        display_name: Exact ``display_name`` to search for.
+
+    Returns:
+        Matching ``TransferConfig`` or ``None``.
+    """
+    for tc in list_transfer_configs(project, region):
+        if tc.display_name == display_name:
+            return tc
+    return None
+
+
+def update_transfer_schedule(
+    project: str,
+    region: str,
+    display_name: str,
+    schedule: str,
+) -> None:
+    """Update the schedule field of a scheduled query.
+
+    Locates the transfer config by *display_name*, then patches only
+    the ``schedule`` field using a ``FieldMask``.
+
+    Args:
+        project: GCP project ID.
+        region: GCP region (e.g. ``us-east1``).
+        display_name: Exact ``display_name`` of the scheduled query.
+        schedule: New schedule string (e.g. ``"every 24 hours"``).
+
+    Raises:
+        ValueError: If the scheduled query is not found.
+    """
+    tc = get_transfer_config(project, region, display_name)
+    if tc is None:
+        msg = (
+            f"Scheduled query '{display_name}' not found "
+            f"in {project}/{region}."
+        )
+        raise ValueError(msg)
+
+    options = client_options_lib.ClientOptions(quota_project_id=project)
+    client = datatransfer.DataTransferServiceClient(client_options=options)
+
+    tc.schedule = schedule
+    from google.protobuf import field_mask_pb2
+
+    update_mask = field_mask_pb2.FieldMask(paths=["schedule"])
+    client.update_transfer_config(
+        transfer_config=tc,
+        update_mask=update_mask,
+    )
+    logger.info("Updated schedule for '%s' to '%s'.", display_name, schedule)
+
+
+def trigger_transfer_run(
+    project: str,
+    region: str,
+    display_name: str,
+) -> None:
+    """Trigger an immediate manual run for a scheduled query.
+
+    Uses ``start_manual_transfer_runs`` with the current timestamp
+    as the requested run time.
+
+    Args:
+        project: GCP project ID.
+        region: GCP region (e.g. ``us-east1``).
+        display_name: Exact ``display_name`` of the scheduled query.
+
+    Raises:
+        ValueError: If the scheduled query is not found.
+    """
+    tc = get_transfer_config(project, region, display_name)
+    if tc is None:
+        msg = (
+            f"Scheduled query '{display_name}' not found "
+            f"in {project}/{region}."
+        )
+        raise ValueError(msg)
+
+    options = client_options_lib.ClientOptions(quota_project_id=project)
+    client = datatransfer.DataTransferServiceClient(client_options=options)
+
+    from google.protobuf import timestamp_pb2
+
+    now = timestamp_pb2.Timestamp()
+    now.GetCurrentTime()
+
+    client.start_manual_transfer_runs(
+        request={
+            "parent": tc.name,
+            "requested_run_time": now,
+        }
+    )
+    logger.info("Triggered manual run for '%s'.", display_name)
+
+
 def list_saved_queries(project: str, region: str) -> list[SavedQueryInfo]:
     """List saved queries via Dataform API.
 

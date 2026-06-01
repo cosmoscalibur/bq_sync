@@ -244,6 +244,58 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to bq_sync.toml (default: auto-discover from CWD).",
     )
 
+    # --- reschedule ---
+    resched_parser = subparsers.add_parser(
+        "reschedule",
+        help="Change the schedule of a BigQuery scheduled query.",
+    )
+    resched_parser.add_argument(
+        "display_name",
+        nargs="?",
+        default=None,
+        help="Exact display_name of the scheduled query.",
+    )
+    # --schedule and --from-file are mutually exclusive sources of
+    # the desired schedule value.
+    schedule_source = resched_parser.add_mutually_exclusive_group()
+    schedule_source.add_argument(
+        "--schedule",
+        type=str,
+        default=None,
+        help='New schedule string (e.g. "every 24 hours").',
+    )
+    schedule_source.add_argument(
+        "--from-file",
+        action="store_true",
+        default=False,
+        help=(
+            "Read schedule from SQL file headers. "
+            "With display_name: sync that query's file. "
+            "Without: batch-sync all files in scheduled_queries/."
+        ),
+    )
+    resched_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview the change without applying it.",
+    )
+    resched_parser.add_argument(
+        "--trigger",
+        action="store_true",
+        help="Trigger a manual run after updating the schedule.",
+    )
+    resched_parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List all scheduled queries and exit.",
+    )
+    resched_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to bq_sync.toml (default: auto-discover from CWD).",
+    )
+
     return parser
 
 
@@ -270,6 +322,8 @@ def main(argv: list[str] | None = None) -> None:
         _handle_rm(args)
     elif args.command == "check":
         _handle_check(args)
+    elif args.command == "reschedule":
+        _handle_reschedule(args)
 
     if args.command == "materialize":
         _handle_materialize(args)
@@ -397,6 +451,78 @@ def _handle_materialize(args: argparse.Namespace) -> None:
         dry_run=args.dry_run,
         yes=args.yes,
         target_name=args.target,
+    )
+
+
+def _handle_reschedule(args: argparse.Namespace) -> None:
+    """Handle the ``reschedule`` subcommand.
+
+    Supports three modes:
+
+    - ``--list``: list all scheduled queries and exit.
+    - ``<display_name> --schedule <schedule>``: update the schedule of
+      a named query, with optional ``--dry-run`` and ``--trigger``.
+    - ``--from-file``: read schedule from SQL file headers.
+      With ``<display_name>``, syncs that specific file.
+      Without ``<display_name>``, batch-syncs all files.
+    """
+    from bq_sync.reschedule import (
+        list_scheduled_queries,
+        reschedule_query,
+        resync_all_from_files,
+        resync_from_file,
+    )
+
+    config_path, config = _resolve_config(args)
+
+    if args.list:
+        list_scheduled_queries(config)
+        return
+
+    if args.from_file:
+        output_root = resolve_output_dir(config, config_path)
+        sq_dir = output_root / "scheduled_queries"
+
+        if args.display_name:
+            # Single file: <scheduled_queries>/<display_name>.sql
+            sql_file = sq_dir / f"{args.display_name}.sql"
+            if not sql_file.is_file():
+                logging.error(
+                    "File not found: %s", sql_file
+                )
+                sys.exit(1)
+            resync_from_file(
+                config,
+                sql_file,
+                dry_run=args.dry_run,
+                trigger=args.trigger,
+            )
+        else:
+            # Batch mode: all .sql files in the directory.
+            if not sq_dir.is_dir():
+                logging.error(
+                    "Scheduled queries directory not found: %s",
+                    sq_dir,
+                )
+                sys.exit(1)
+            resync_all_from_files(
+                config, sq_dir, dry_run=args.dry_run
+            )
+        return
+
+    if not args.display_name or not args.schedule:
+        logging.error(
+            "reschedule requires <display_name> and --schedule "
+            "(or use --list / --from-file)."
+        )
+        sys.exit(1)
+
+    reschedule_query(
+        config,
+        args.display_name,
+        args.schedule,
+        dry_run=args.dry_run,
+        trigger=args.trigger,
     )
 
 
