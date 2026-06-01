@@ -166,7 +166,6 @@ def write_routine_sql(path: Path, routine: RoutineInfo) -> None:
     header = f"-- Routine: {routine.name}\n-- Language: {routine.language}\n\n"
     path.write_text(header + _normalize_text(routine.sql), encoding="utf-8")
 
-
 def write_scheduled_query_sql(path: Path, sq: ScheduledQueryInfo) -> None:
     """Write a scheduled query SQL with metadata header.
 
