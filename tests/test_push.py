@@ -43,6 +43,7 @@ def _make_output_tree(tmp_path: Path) -> Path:
     (output_root / "my_dataset" / "models").mkdir(parents=True)
     (output_root / "my_dataset" / "routines").mkdir(parents=True)
     (output_root / "saved_queries").mkdir(parents=True)
+    (output_root / "scheduled_queries").mkdir(parents=True)
     return output_root
 
 
@@ -114,6 +115,16 @@ class TestClassifyPath:
         result = _classify_path(f, output_root)
 
         assert result == ("routines", "my_dataset", "my_func")
+
+    def test_scheduled_query_sql(self, tmp_path: Path) -> None:
+        """Project-level scheduled query SQL is classified correctly."""
+        output_root = _make_output_tree(tmp_path)
+        f = output_root / "scheduled_queries" / "daily_load.sql"
+        f.write_text("SELECT 1")
+
+        result = _classify_path(f, output_root)
+
+        assert result == ("scheduled_queries", "", "daily_load")
 
 
 # ---------------------------------------------------------------------------
@@ -673,3 +684,26 @@ class TestPushFileUsesUpsert:
         assert call_kwargs.kwargs.get("arguments") == [
             {"name": "x", "type": "INT64", "mode": "IN"}
         ]
+
+    def test_scheduled_query_sql_calls_upsert(self, tmp_path: Path) -> None:
+        """Pushing a scheduled query SQL calls upsert_scheduled_query_sql."""
+        from bq_sync.push import _push_file
+
+        output_root = _make_output_tree(tmp_path)
+        sq = output_root / "scheduled_queries" / "daily_load.sql"
+        sq.write_text(
+            "-- Scheduled Query: daily_load\n"
+            "-- Schedule: every 24 hours\n"
+            "\n"
+            "CREATE OR REPLACE TABLE `p.d.t` AS SELECT 1\n"
+        )
+
+        with patch("bq_sync.push.bq_client") as mock_bq:
+            _push_file(sq, output_root, "my-project", "us-east1")
+
+        mock_bq.upsert_scheduled_query_sql.assert_called_once_with(
+            "my-project",
+            "us-east1",
+            "daily_load",
+            "CREATE OR REPLACE TABLE `p.d.t` AS SELECT 1\n",
+        )

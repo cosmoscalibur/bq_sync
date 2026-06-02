@@ -405,6 +405,78 @@ def trigger_transfer_run(
     logger.info("Triggered manual run for '%s'.", display_name)
 
 
+def update_transfer_sql(
+    project: str,
+    region: str,
+    display_name: str,
+    sql: str,
+) -> None:
+    """Update the SQL query of a scheduled query.
+
+    Locates the transfer config by *display_name*, then patches the
+    ``params.query`` field using a ``FieldMask``.
+
+    Args:
+        project: GCP project ID.
+        region: GCP region (e.g. ``us-east1``).
+        display_name: Exact ``display_name`` of the scheduled query.
+        sql: New SQL query string.
+
+    Raises:
+        ValueError: If the scheduled query is not found.
+    """
+    tc = get_transfer_config(project, region, display_name)
+    if tc is None:
+        msg = (
+            f"Scheduled query '{display_name}' not found "
+            f"in {project}/{region}."
+        )
+        raise ValueError(msg)
+
+    options = client_options_lib.ClientOptions(quota_project_id=project)
+    client = datatransfer.DataTransferServiceClient(client_options=options)
+
+    tc.params["query"] = sql
+    from google.protobuf import field_mask_pb2
+
+    update_mask = field_mask_pb2.FieldMask(paths=["params"])
+    client.update_transfer_config(
+        transfer_config=tc,
+        update_mask=update_mask,
+    )
+    logger.info("Updated SQL for scheduled query '%s'.", display_name)
+
+
+def upsert_scheduled_query_sql(
+    project: str,
+    region: str,
+    display_name: str,
+    sql: str,
+) -> None:
+    """Update scheduled query SQL; warn and skip when absent.
+
+    Scheduled queries require schedule, destination dataset, and other
+    config that the SQL file does not carry, so there is no create
+    fallback — only update.
+
+    Args:
+        project: GCP project ID.
+        region: GCP region (e.g. ``us-east1``).
+        display_name: Scheduled query display name.
+        sql: New SQL query string.
+    """
+    try:
+        update_transfer_sql(project, region, display_name, sql)
+    except ValueError:
+        logger.warning(
+            "Scheduled query '%s' not found in %s/%s; skipping SQL push. "
+            "Create the scheduled query in the BQ console first.",
+            display_name,
+            project,
+            region,
+        )
+
+
 def list_saved_queries(project: str, region: str) -> list[SavedQueryInfo]:
     """List saved queries via Dataform API.
 

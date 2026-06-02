@@ -61,14 +61,24 @@ class RoutineModelUpdate:
     return_type: str | None = None
 
 
+@dataclass(frozen=True)
+class ScheduledQueryUpdate:
+    """Mutable fields for a BigQuery scheduled query SQL update."""
+
+    name: str
+    sql: str
+
+
 # ---------------------------------------------------------------------------
 # SQL readers
 # ---------------------------------------------------------------------------
 
-# Header patterns emitted by ``write_saved_query_sql`` and ``write_routine_sql``.
+# Header patterns emitted by writers for SQL files.
 _SAVED_QUERY_HEADER_RE = re.compile(r"^--\s*Saved Query:\s*(.+)$")
 _ROUTINE_NAME_RE = re.compile(r"^--\s*Routine:\s*(.+)$")
 _ROUTINE_LANG_RE = re.compile(r"^--\s*Language:\s*(.+)$")
+_SCHEDULED_QUERY_NAME_RE = re.compile(r"^--\s*Scheduled Query:\s*(.+)$")
+_SCHEDULED_QUERY_SCHEDULE_RE = re.compile(r"^--\s*Schedule:\s*(.+)$")
 
 
 def read_view_sql(path: Path) -> ViewUpdate:
@@ -164,6 +174,52 @@ def read_routine_sql(path: Path) -> RoutineUpdate:
 
     body = "".join(lines[body_start:])
     return RoutineUpdate(name=name, body=body, language=language)
+
+
+def read_scheduled_query_sql(path: Path) -> ScheduledQueryUpdate:
+    """Parse a scheduled-query ``.sql`` file into a ``ScheduledQueryUpdate``.
+
+    Strips the ``-- Scheduled Query: <name>`` and
+    ``-- Schedule: <schedule>`` headers emitted by
+    ``write_scheduled_query_sql``.  The schedule string is not included
+    in the result because schedule changes are managed separately via
+    the ``reschedule`` command.
+
+    Args:
+        path: Path to the ``.sql`` file produced by
+            ``write_scheduled_query_sql``.
+
+    Returns:
+        A ``ScheduledQueryUpdate`` with *name* and *sql* populated.
+    """
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=True)
+
+    name = path.stem
+    body_start = 0
+
+    for idx, line in enumerate(lines):
+        stripped = line.rstrip("\n")
+        m_name = _SCHEDULED_QUERY_NAME_RE.match(stripped)
+        if m_name:
+            name = m_name.group(1).strip()
+            body_start = idx + 1
+            continue
+        m_sched = _SCHEDULED_QUERY_SCHEDULE_RE.match(stripped)
+        if m_sched:
+            # Skip the schedule line; not needed for push.
+            body_start = idx + 1
+            continue
+        # Stop scanning once a non-header, non-blank line appears.
+        if stripped.strip():
+            break
+
+    # Skip blank lines between header and body.
+    while body_start < len(lines) and lines[body_start].strip() == "":
+        body_start += 1
+
+    sql = "".join(lines[body_start:])
+    return ScheduledQueryUpdate(name=name, sql=sql)
 
 
 # ---------------------------------------------------------------------------
