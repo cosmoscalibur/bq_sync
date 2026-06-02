@@ -9,18 +9,27 @@ from bq_sync.readers import (
     ModelUpdate,
     RoutineUpdate,
     SavedQueryUpdate,
+    ScheduledQueryUpdate,
     ViewUpdate,
     read_model_yaml,
     read_routine_sql,
     read_saved_query_sql,
+    read_scheduled_query_sql,
     read_view_model_yaml,
     read_view_sql,
 )
-from bq_sync.resources import RoutineInfo, SavedQueryInfo, TableInfo, ViewInfo
+from bq_sync.resources import (
+    RoutineInfo,
+    SavedQueryInfo,
+    ScheduledQueryInfo,
+    TableInfo,
+    ViewInfo,
+)
 from bq_sync.writers import (
     write_model_yaml,
     write_routine_sql,
     write_saved_query_sql,
+    write_scheduled_query_sql,
     write_view_model_yaml,
     write_view_sql,
 )
@@ -228,3 +237,52 @@ class TestReadRoutineSql:
         assert result.name == "my_func"
         assert result.body == "RETURN 42;"
         assert result.language == "SQL"
+
+
+class TestReadScheduledQuerySql:
+    """Tests for ``read_scheduled_query_sql``."""
+
+    def test_round_trip(self, tmp_path: Path) -> None:
+        """Parse a scheduled-query SQL file produced by the writer."""
+        sql = "CREATE OR REPLACE TABLE `p.d.t` AS SELECT * FROM `p.d.src`"
+        sq = ScheduledQueryInfo(
+            name="daily_load",
+            sql=sql,
+            schedule="every 24 hours",
+            modified=TS,
+        )
+        path = tmp_path / "daily_load.sql"
+        write_scheduled_query_sql(path, sq)
+
+        result = read_scheduled_query_sql(path)
+
+        assert isinstance(result, ScheduledQueryUpdate)
+        assert result.name == "daily_load"
+        assert result.sql == sql
+
+    def test_fallback_to_stem(self, tmp_path: Path) -> None:
+        """When header is missing, name falls back to file stem."""
+        path = tmp_path / "my_scheduled.sql"
+        path.write_text("SELECT 1", encoding="utf-8")
+
+        result = read_scheduled_query_sql(path)
+
+        assert result.name == "my_scheduled"
+        assert result.sql == "SELECT 1"
+
+    def test_strips_schedule_header(self, tmp_path: Path) -> None:
+        """The ``-- Schedule:`` header line is not included in the SQL body."""
+        path = tmp_path / "nightly.sql"
+        path.write_text(
+            "-- Scheduled Query: nightly\n"
+            "-- Schedule: every 24 hours\n"
+            "\n"
+            "SELECT * FROM t\n",
+            encoding="utf-8",
+        )
+
+        result = read_scheduled_query_sql(path)
+
+        assert result.name == "nightly"
+        assert "Schedule" not in result.sql
+        assert result.sql == "SELECT * FROM t\n"

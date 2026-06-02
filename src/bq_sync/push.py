@@ -25,6 +25,7 @@ from bq_sync.readers import (
     read_routine_model_yaml,
     read_routine_sql,
     read_saved_query_sql,
+    read_scheduled_query_sql,
     read_view_model_yaml,
     read_view_sql,
 )
@@ -36,9 +37,13 @@ _VIEW_DIR = "views"
 _MODEL_DIR = "models"
 _ROUTINE_DIR = "routines"
 _SAVED_QUERY_DIR = "saved_queries"
+_SCHEDULED_QUERY_DIR = "scheduled_queries"
 
 # Directories that can be pushed or removed.
-_KNOWN_DIRS = {_VIEW_DIR, _MODEL_DIR, _ROUTINE_DIR, _SAVED_QUERY_DIR}
+_KNOWN_DIRS = {
+    _VIEW_DIR, _MODEL_DIR, _ROUTINE_DIR, _SAVED_QUERY_DIR,
+    _SCHEDULED_QUERY_DIR,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +102,9 @@ def _classify_path(file: Path, output_root: Path) -> tuple[str, str, str] | None
     # Project-level saved queries: saved_queries/<name>.ext
     if len(parts) == 2 and parts[0] == _SAVED_QUERY_DIR:
         return _SAVED_QUERY_DIR, "", Path(parts[1]).stem
+    # Project-level scheduled queries: scheduled_queries/<name>.ext
+    if len(parts) == 2 and parts[0] == _SCHEDULED_QUERY_DIR:
+        return _SCHEDULED_QUERY_DIR, "", Path(parts[1]).stem
     return None
 
 
@@ -181,6 +189,12 @@ def _push_file(
     elif resource_type == _SAVED_QUERY_DIR and file.suffix == ".sql":
         update = read_saved_query_sql(file)
         bq_client.upsert_saved_query(project, region, update.name, update.sql)
+
+    elif resource_type == _SCHEDULED_QUERY_DIR and file.suffix == ".sql":
+        update = read_scheduled_query_sql(file)
+        bq_client.upsert_scheduled_query_sql(
+            project, region, update.name, update.sql
+        )
 
     else:
         logger.warning("Unsupported resource type/extension, skipping: %s", file)
