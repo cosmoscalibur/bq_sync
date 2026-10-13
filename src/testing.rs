@@ -71,6 +71,10 @@ impl BqApi for FakeApi {
         self.record(format!("start_manual_run {name}"));
         Ok(())
     }
+    fn update_transfer_config_query(&self, _: &str, name: &str, sql: &str) -> Result<()> {
+        self.record(format!("update_query {name} {sql}"));
+        Ok(())
+    }
     fn fetch_table_to_file(
         &self,
         p: &str,

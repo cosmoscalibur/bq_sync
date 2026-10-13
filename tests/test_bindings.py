@@ -102,6 +102,15 @@ def test_readers(tmp_path: Path) -> None:
     }
     assert bq_sync.read_view_sql(saved)["name"] == "q"
 
+    scheduled = tmp_path / "daily.sql"
+    scheduled.write_text(
+        "-- Scheduled Query: daily\n-- Schedule: every 24 hours\n\nSELECT 2\n"
+    )
+    assert bq_sync.read_scheduled_query_sql(scheduled) == {
+        "name": "daily",
+        "sql": "SELECT 2\n",
+    }
+
     model = tmp_path / "t.yaml"
     model.write_text(
         'name: t\ndescription: "Tabla de declaración"\nschema:\n'

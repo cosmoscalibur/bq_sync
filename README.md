@@ -102,7 +102,14 @@ By default, auto mode excludes materialized model YAMLs (tables without a
 corresponding SQL file).  Use `--include-models` to include them.
 
 Pushable resources: views (SQL), routines (SQL/JS), models (YAML descriptions),
-and saved queries (SQL).
+saved queries (SQL) and scheduled queries (SQL).
+
+Scheduled queries are update-only: `push` replaces the query SQL of an
+existing scheduled query (matched by its `-- Scheduled Query:` header) and
+keeps its other settings. The `-- Schedule:` header is not pushed — use
+`bq-sync reschedule --from-file` for schedule changes. A scheduled query
+that does not exist in BigQuery is skipped with a warning; create it in the
+console first.
 
 | Flag | Description |
 | --- | --- |

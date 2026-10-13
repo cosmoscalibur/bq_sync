@@ -46,6 +46,10 @@ pub trait BqApi {
     /// Start a manual run, now, for a transfer config (by resource name).
     fn start_manual_transfer_run(&self, project: &str, name: &str) -> Result<()>;
 
+    /// Replace ``params.query`` of a transfer config (by resource name),
+    /// keeping its other parameters.
+    fn update_transfer_config_query(&self, project: &str, name: &str, sql: &str) -> Result<()>;
+
     fn list_scheduled_queries(
         &self,
         project: &str,
@@ -89,6 +93,30 @@ pub trait BqApi {
             .ok_or_else(|| sq_not_found(project, region, display_name))?;
         self.update_transfer_config_schedule(project, &tc.name, schedule)?;
         log::info!("Updated schedule for '{display_name}' to '{schedule}'.");
+        Ok(())
+    }
+
+    /// Update the SQL of the scheduled query named *display_name*.
+    ///
+    /// There is no create path: a scheduled query also needs a schedule,
+    /// destination and other settings the SQL file does not carry, so a
+    /// missing query is reported and skipped.
+    fn upsert_scheduled_query_sql(
+        &self,
+        project: &str,
+        region: &str,
+        display_name: &str,
+        sql: &str,
+    ) -> Result<()> {
+        let Some(tc) = self.get_transfer_config(project, region, display_name)? else {
+            log::warn!(
+                "Scheduled query '{display_name}' not found in {project}/{region}; \
+                 skipping SQL push. Create the scheduled query in the BQ console first."
+            );
+            return Ok(());
+        };
+        self.update_transfer_config_query(project, &tc.name, sql)?;
+        log::info!("Updated SQL for scheduled query '{display_name}'.");
         Ok(())
     }
 

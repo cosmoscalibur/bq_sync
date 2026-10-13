@@ -143,6 +143,15 @@ fn read_saved_query_sql<'py>(py: Python<'py>, path: PathBuf) -> PyRes<Bound<'py,
 }
 
 #[pyfunction]
+fn read_scheduled_query_sql<'py>(py: Python<'py>, path: PathBuf) -> PyRes<Bound<'py, PyDict>> {
+    let u = readers::read_scheduled_query_sql(&path).map_err(to_py)?;
+    let d = PyDict::new(py);
+    d.set_item("name", u.name)?;
+    d.set_item("sql", u.sql)?;
+    Ok(d)
+}
+
+#[pyfunction]
 fn read_routine_sql<'py>(py: Python<'py>, path: PathBuf) -> PyRes<Bound<'py, PyDict>> {
     let u = readers::read_routine_sql(&path).map_err(to_py)?;
     let d = PyDict::new(py);
@@ -462,6 +471,7 @@ fn _bq_sync(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_resolve_output_dir, m)?)?;
     m.add_function(wrap_pyfunction!(read_view_sql, m)?)?;
     m.add_function(wrap_pyfunction!(read_saved_query_sql, m)?)?;
+    m.add_function(wrap_pyfunction!(read_scheduled_query_sql, m)?)?;
     m.add_function(wrap_pyfunction!(read_routine_sql, m)?)?;
     m.add_function(wrap_pyfunction!(read_model_yaml, m)?)?;
     m.add_function(wrap_pyfunction!(read_routine_model_yaml, m)?)?;

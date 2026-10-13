@@ -21,7 +21,16 @@ const VIEW_DIR: &str = "views";
 const MODEL_DIR: &str = "models";
 const ROUTINE_DIR: &str = "routines";
 const SAVED_QUERY_DIR: &str = "saved_queries";
-const KNOWN_DIRS: [&str; 4] = [VIEW_DIR, MODEL_DIR, ROUTINE_DIR, SAVED_QUERY_DIR];
+const SCHEDULED_QUERY_DIR: &str = "scheduled_queries";
+const KNOWN_DIRS: [&str; 5] = [
+    VIEW_DIR,
+    MODEL_DIR,
+    ROUTINE_DIR,
+    SAVED_QUERY_DIR,
+    SCHEDULED_QUERY_DIR,
+];
+/// Project-level resource directories (``<output_root>/<dir>/<name>``).
+const PROJECT_DIRS: [&str; 2] = [SAVED_QUERY_DIR, SCHEDULED_QUERY_DIR];
 
 /// Table-replace specification (``push --data SOURCE DEST``).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,8 +96,8 @@ pub fn classify_path(file: &Path, output_root: &Path) -> Option<Classified> {
             dataset: dataset.clone(),
             name: stem(filename),
         }),
-        [dir, filename] if dir == SAVED_QUERY_DIR => Some(Classified {
-            resource_type: SAVED_QUERY_DIR.into(),
+        [dir, filename] if PROJECT_DIRS.contains(&dir.as_str()) => Some(Classified {
+            resource_type: dir.clone(),
             dataset: String::new(),
             name: stem(filename),
         }),
@@ -159,6 +168,10 @@ pub fn push_file(
         (SAVED_QUERY_DIR, "sql") => {
             let u = readers::read_saved_query_sql(file)?;
             api.upsert_saved_query(project, region, &u.name, &u.sql)
+        }
+        (SCHEDULED_QUERY_DIR, "sql") => {
+            let u = readers::read_scheduled_query_sql(file)?;
+            api.upsert_scheduled_query_sql(project, region, &u.name, &u.sql)
         }
         _ => {
             log::warn!(
@@ -612,6 +625,7 @@ mod tests {
             "my_dataset/models",
             "my_dataset/routines",
             "saved_queries",
+            "scheduled_queries",
         ] {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
@@ -649,6 +663,11 @@ mod tests {
         assert_eq!(
             classify_path(&f, &root),
             cls("saved_queries", "", "my_query")
+        );
+        let f = write(&root.join("scheduled_queries/daily_load.sql"), "SELECT 1");
+        assert_eq!(
+            classify_path(&f, &root),
+            cls("scheduled_queries", "", "daily_load")
         );
         let f = write(&root.join("my_dataset/routines/fn.sql"), "x");
         assert_eq!(
@@ -823,6 +842,42 @@ mod tests {
         };
         push_auto(&api, &config(), &cfg, &opts).unwrap();
         assert!(api.calls().is_empty());
+    }
+
+    #[test]
+    fn scheduled_query_push_updates_sql_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, root) = tree(dir.path());
+        let sq = write(
+            &root.join("scheduled_queries/daily_load.sql"),
+            "-- Scheduled Query: daily_load\n-- Schedule: every 24 hours\n\nCREATE OR REPLACE TABLE `p.d.t` AS SELECT 1\n",
+        );
+        let missing = write(
+            &root.join("scheduled_queries/gone.sql"),
+            "-- Scheduled Query: gone\n-- Schedule: every 24 hours\n\nSELECT 1\n",
+        );
+        let api = FakeApi::default();
+        *api.transfer_configs.borrow_mut() = vec![crate::resources::TransferConfig {
+            name: "projects/my-project/locations/us-east1/transferConfigs/7".into(),
+            display_name: "daily_load".into(),
+            data_source_id: "scheduled_query".into(),
+            ..Default::default()
+        }];
+        let opts = PushOptions {
+            yes: true,
+            ..Default::default()
+        };
+        let paths = [&sq, &missing].map(|p| p.to_string_lossy().into_owned());
+        push_manual(&api, &config(), &cfg, &paths, None, &opts).unwrap();
+        // Only the existing query is updated; the missing one is skipped
+        // (no create path) and the schedule header is not pushed.
+        assert_eq!(
+            api.calls(),
+            vec![
+                "update_query projects/my-project/locations/us-east1/transferConfigs/7 \
+                 CREATE OR REPLACE TABLE `p.d.t` AS SELECT 1\n"
+            ]
+        );
     }
 
     #[test]

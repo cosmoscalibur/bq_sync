@@ -892,6 +892,28 @@ impl BqApi for GcpClient {
         Ok(())
     }
 
+    fn update_transfer_config_query(&self, project: &str, name: &str, sql: &str) -> Result<()> {
+        self.block_on(async {
+            let client = self.transfer(project).await?;
+            let current = client
+                .get_transfer_config()
+                .set_name(name)
+                .send()
+                .await
+                .map_err(gax_error)?;
+            let mut params = current.params.unwrap_or_default();
+            params.insert("query".to_owned(), Value::String(sql.to_owned()));
+            client
+                .update_transfer_config()
+                .set_transfer_config(dts::TransferConfig::new().set_name(name).set_params(params))
+                .set_update_mask(google_cloud_wkt::FieldMask::default().set_paths(["params"]))
+                .send()
+                .await
+                .map_err(gax_error)
+        })?;
+        Ok(())
+    }
+
     fn fetch_table_to_file(
         &self,
         project: &str,

@@ -34,6 +34,13 @@ pub struct SavedQueryUpdate {
     pub sql: String,
 }
 
+/// Mutable fields for a scheduled query SQL update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledQueryUpdate {
+    pub name: String,
+    pub sql: String,
+}
+
 /// Mutable fields for a routine update (SQL or JavaScript).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutineUpdate {
@@ -54,6 +61,10 @@ pub struct RoutineModelUpdate {
 
 static SAVED_QUERY_HEADER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^--\s*Saved Query:\s*(.+)$").unwrap());
+static SCHEDULED_QUERY_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^--\s*Scheduled Query:\s*(.+)$").unwrap());
+static SCHEDULED_QUERY_SCHEDULE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^--\s*Schedule:\s*(.+)$").unwrap());
 static ROUTINE_NAME_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^--\s*Routine:\s*(.+)$").unwrap());
 static ROUTINE_LANG_RE: LazyLock<Regex> =
@@ -100,6 +111,42 @@ fn parse_saved_query_text(text: &str, fallback_name: String) -> SavedQueryUpdate
         }
     }
     SavedQueryUpdate {
+        name,
+        sql: lines[body_start..].concat(),
+    }
+}
+
+/// Parse a scheduled-query ``.sql`` file, stripping its
+/// ``-- Scheduled Query`` / ``-- Schedule`` headers.  The schedule is not
+/// returned: it is managed by ``reschedule``.
+pub fn read_scheduled_query_sql(path: &Path) -> Result<ScheduledQueryUpdate> {
+    let text = read_text(path)?;
+    Ok(parse_scheduled_query_text(&text, file_stem(path)))
+}
+
+fn parse_scheduled_query_text(text: &str, fallback_name: String) -> ScheduledQueryUpdate {
+    let lines = split_lines_keepends(text);
+    let mut name = fallback_name;
+    let mut body_start = 0;
+    for (idx, line) in lines.iter().enumerate() {
+        let stripped = strip_eol(line);
+        if let Some(m) = SCHEDULED_QUERY_NAME_RE.captures(stripped) {
+            name = m[1].trim().to_owned();
+            body_start = idx + 1;
+            continue;
+        }
+        if SCHEDULED_QUERY_SCHEDULE_RE.is_match(stripped) {
+            body_start = idx + 1;
+            continue;
+        }
+        if !stripped.trim().is_empty() {
+            break;
+        }
+    }
+    while body_start < lines.len() && lines[body_start].trim().is_empty() {
+        body_start += 1;
+    }
+    ScheduledQueryUpdate {
         name,
         sql: lines[body_start..].concat(),
     }
@@ -374,6 +421,37 @@ mod tests {
         std::fs::write(&p, "SELECT 1").unwrap();
         let u = read_routine_sql(&p).unwrap();
         assert_eq!((u.name.as_str(), u.language.as_str()), ("bare", "SQL"));
+    }
+
+    #[test]
+    fn scheduled_query_roundtrip_fallback_and_header_strip() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("daily_load.sql");
+        let sql = "CREATE OR REPLACE TABLE `p.d.t` AS SELECT * FROM `p.d.src`";
+        let sq = crate::resources::ScheduledQueryInfo {
+            name: "daily_load".into(),
+            sql: sql.into(),
+            schedule: "every 24 hours".into(),
+            modified: ts(),
+        };
+        writers::write_scheduled_query_sql(&p, &sq).unwrap();
+        let u = read_scheduled_query_sql(&p).unwrap();
+        assert_eq!((u.name.as_str(), u.sql.as_str()), ("daily_load", sql));
+
+        let p = dir.path().join("my_scheduled.sql");
+        std::fs::write(&p, "SELECT 1").unwrap();
+        let u = read_scheduled_query_sql(&p).unwrap();
+        assert_eq!(
+            (u.name.as_str(), u.sql.as_str()),
+            ("my_scheduled", "SELECT 1")
+        );
+
+        let u = parse_scheduled_query_text(
+            "-- Scheduled Query: nightly\n-- Schedule: every 24 hours\n\nSELECT * FROM t\n",
+            "x".into(),
+        );
+        assert_eq!(u.name, "nightly");
+        assert_eq!(u.sql, "SELECT * FROM t\n");
     }
 
     #[test]
