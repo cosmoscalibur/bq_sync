@@ -2,7 +2,7 @@
 //!
 //! Orchestrators depend on the [`BqApi`] trait so they can be exercised
 //! against in-memory fakes; [`GcpClient`] is the production implementation
-//! backed by the Google Cloud REST APIs.
+//! backed by the official Google Cloud Rust SDK.
 
 mod gcp;
 pub mod tabular;

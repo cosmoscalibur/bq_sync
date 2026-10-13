@@ -30,7 +30,12 @@ base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.6", features = ["derive"] }
 futures = "0.3"
-gcp_auth = "0.12"
+google-cloud-auth = "1"
+google-cloud-bigquery-datatransfer-v1 = "1"
+google-cloud-bigquery-v2 = "1"
+google-cloud-dataform-v1 = "1"
+google-cloud-gax = "1"
+google-cloud-wkt = "1"
 inbq = "0.18"
 log = { version = "0.4", features = ["std"] }
 parquet = { version = "60", default-features = false, features = ["arrow", "zstd", "snap"] }

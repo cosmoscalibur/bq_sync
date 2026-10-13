@@ -20,13 +20,22 @@ cargo install --path .
 Building from source requires Rust 1.99 (pinned in `rust-toolchain.toml`)
 and a C compiler (tree-sitter grammar).
 
-### Authentication
+### Google Cloud access
 
-Google Cloud credentials are resolved with Application Default Credentials:
-`GOOGLE_APPLICATION_CREDENTIALS`, `gcloud auth application-default login`,
-the GCE/GKE metadata server, or the `gcloud` CLI. Credentials are only
-required by commands that call Google Cloud (`check` works offline unless
-`--online` is given).
+All Google Cloud calls go through the official Google Cloud Rust SDK
+([`google-cloud-rust`](https://github.com/googleapis/google-cloud-rust)):
+`google-cloud-bigquery-v2` (tables, routines, query jobs),
+`google-cloud-bigquery-datatransfer-v1` (scheduled queries) and
+`google-cloud-dataform-v1` (saved queries). Two BigQuery endpoints the SDK
+does not expose — `tabledata.list` (row reads for `fetch`) and the media
+upload behind `push --data` — are called over HTTPS with the SDK's
+credentials.
+
+Credentials come from Application Default Credentials via
+`google-cloud-auth`: `GOOGLE_APPLICATION_CREDENTIALS`,
+`gcloud auth application-default login`, or the GCE/GKE metadata server.
+They are only needed by commands that call Google Cloud (`check` works
+offline unless `--online` is given).
 
 ## Quick Start
 
