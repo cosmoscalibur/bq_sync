@@ -4,13 +4,29 @@ Sync BigQuery resources to a local directory structure.
 
 ## Install
 
-Requires Python ≥ 3.13.
+`bq-sync` is written in Rust and ships both as a native binary and as a
+Python package (PyO3 extension, one abi3 wheel for CPython ≥ 3.12).
 
 ```zsh
+# Python package (provides the `bq-sync` command and `import bq_sync`)
 pip install .
 # or
 uv pip install .
+
+# Native binary only
+cargo install --path .
 ```
+
+Building from source requires Rust 1.99 (pinned in `rust-toolchain.toml`)
+and a C compiler (tree-sitter grammar).
+
+### Authentication
+
+Google Cloud credentials are resolved with Application Default Credentials:
+`GOOGLE_APPLICATION_CREDENTIALS`, `gcloud auth application-default login`,
+the GCE/GKE metadata server, or the `gcloud` CLI. Credentials are only
+required by commands that call Google Cloud (`check` works offline unless
+`--online` is given).
 
 ## Quick Start
 
@@ -32,10 +48,13 @@ uv pip install .
 
 ```text
 bq-sync [--version] [-v]
-bq-sync pull  [--dataset DATASET] [--dry-run] [--config PATH] [--force] [--force-file FILE]
-bq-sync fetch <project/dataset/model> [-f csv|parquet] [-o DIR] [--config PATH]
-bq-sync push  [FILE ...] [--data SOURCE DEST] [--since HOURS] [--dry-run] [--yes] [--include-models] [--config PATH]
-bq-sync rm    <path>... [--dry-run] [--yes] [--config PATH]
+bq-sync pull        [--dataset DATASET] [--dry-run] [--config PATH] [--force] [--force-file FILE]
+bq-sync fetch       <project/dataset/model> [-f csv|parquet] [-o DIR] [--config PATH]
+bq-sync push        [FILE ...] [--data SOURCE DEST] [--since HOURS] [--dry-run] [--yes] [--include-models] [--config PATH]
+bq-sync rm          <path>... [--dry-run] [--yes] [--config PATH]
+bq-sync check       [FILE ...] [--online] [--config PATH]
+bq-sync materialize <project/dataset/name> [--target NAME] [--dry-run] [--yes] [--config PATH]
+bq-sync reschedule  [DISPLAY_NAME] [--schedule S | --from-file] [--dry-run] [--trigger] [--list] [--config PATH]
 ```
 
 ### pull options
@@ -57,6 +76,11 @@ bq-sync rm    <path>... [--dry-run] [--yes] [--config PATH]
 | `-f`, `--format` | Output format: `csv` (default) or `parquet` |
 | `-o`, `--output-dir` | Directory where a `data/` folder is created (default: config output dir) |
 | `--config` | Path to `bq_sync.toml` (default: auto-discover from CWD upward) |
+
+Views are fetched by running `SELECT *` on them. Scalar columns keep their
+BigQuery type (INT64, FLOAT64, BOOL, NUMERIC, TIMESTAMP, DATETIME, DATE,
+TIME, BYTES); `REPEATED` and `RECORD` columns are written as JSON text.
+Parquet output is ZSTD-compressed.
 
 ### push options
 
@@ -138,6 +162,39 @@ cause `bq-sync` to **warn and exit**. All files must be committed first.
 > **Warning**
 > Saved queries use the Dataform API, which is relatively new and may
 > change without notice.
+
+## Python API
+
+The Python package exposes the same operations as functions:
+
+```python
+import bq_sync
+
+summary = bq_sync.check(config="bq_sync.toml")      # offline SQL/JS validation
+print(summary["failed"], summary["warned"], summary["passed"])
+
+bq_sync.pull(dry_run=True)                           # same as `bq-sync pull --dry-run`
+bq_sync.fetch("my-project/my_dataset/my_table", format="parquet", output_dir="data")
+bq_sync.read_model_yaml("my-project/my_dataset/models/users.yaml")
+```
+
+Failures raise `bq_sync.BqSyncError` (`bq_sync.NotFoundError` for missing
+BigQuery resources, `OSError` for filesystem errors). Long-running calls
+release the GIL. Type stubs are included (`bq_sync/_bq_sync.pyi`).
+
+## Development
+
+```zsh
+cargo test                      # Rust unit tests
+cargo clippy --all-targets --features python
+uv venv && uv pip install maturin pytest
+maturin develop --uv            # build the extension into the venv
+pytest                          # Python binding tests
+```
+
+Layout: `src/` (Rust crate: library, `bq-sync` binary, PyO3 module in
+`src/python.rs` behind the `python` feature), `python/bq_sync/` (Python
+package shim and stubs), `tests/` (Python binding tests).
 
 ## License
 

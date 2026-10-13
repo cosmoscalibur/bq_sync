@@ -1,0 +1,61 @@
+"""bq_sync — Sync BigQuery resources to a local directory structure.
+
+The implementation lives in the Rust extension module ``bq_sync._bq_sync``;
+this package re-exports its public API.
+"""
+
+from bq_sync._bq_sync import (
+    BqSyncError,
+    NotFoundError,
+    __version__,
+    check,
+    check_files,
+    discover_config,
+    discover_sql_files,
+    fetch,
+    humanize_bytes,
+    list_scheduled_queries,
+    load_config,
+    materialize,
+    parse_resource_path,
+    parse_schedule_from_file,
+    pull,
+    push,
+    read_model_yaml,
+    read_routine_model_yaml,
+    read_routine_sql,
+    read_saved_query_sql,
+    read_view_sql,
+    reschedule,
+    resolve_output_dir,
+    rm,
+    set_verbose,
+)
+
+__all__ = [
+    "BqSyncError",
+    "NotFoundError",
+    "__version__",
+    "check",
+    "check_files",
+    "discover_config",
+    "discover_sql_files",
+    "fetch",
+    "humanize_bytes",
+    "list_scheduled_queries",
+    "load_config",
+    "materialize",
+    "parse_resource_path",
+    "parse_schedule_from_file",
+    "pull",
+    "push",
+    "read_model_yaml",
+    "read_routine_model_yaml",
+    "read_routine_sql",
+    "read_saved_query_sql",
+    "read_view_sql",
+    "reschedule",
+    "resolve_output_dir",
+    "rm",
+    "set_verbose",
+]

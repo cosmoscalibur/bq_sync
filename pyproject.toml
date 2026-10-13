@@ -1,22 +1,20 @@
 [build-system]
-requires = ["setuptools>=75"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
 
 [project]
 name = "bq-sync"
-version = "0.2.0"
 description = "Sync BigQuery resources to a local directory structure."
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 license = "MIT"
-dependencies = [
-    "google-cloud-bigquery",
-    "google-cloud-bigquery-datatransfer",
-    "google-cloud-dataform",
-    "inbq",
-    "polars",
-    "tree-sitter",
-    "tree-sitter-javascript",
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
 ]
 
 [project.scripts]
@@ -24,9 +22,19 @@ bq-sync = "bq_sync.cli:main"
 
 [dependency-groups]
 dev = [
+    "maturin>=1.9,<2",
     "pytest",
     "ruff",
 ]
+
+[tool.maturin]
+features = ["python"]
+python-source = "python"
+module-name = "bq_sync._bq_sync"
+bindings = "pyo3"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 88
@@ -36,3 +44,6 @@ select = ["E", "F", "I", "W"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["bq_sync"]
