@@ -52,6 +52,12 @@ impl Error {
     pub fn is_not_found(&self) -> bool {
         matches!(self, Error::NotFound(_))
     }
+
+    /// Whether the remote service rejected the caller (HTTP 403), which also
+    /// covers an API that is not enabled for the project.
+    pub fn is_permission_denied(&self) -> bool {
+        matches!(self, Error::Api { status: 403, .. })
+    }
 }
 
 /// Crate-wide result alias.

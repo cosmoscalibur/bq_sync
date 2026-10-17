@@ -312,12 +312,15 @@ fn pull(
     .map_err(to_py)
 }
 
+/// Run *command* with the GIL released.
+fn execute(command: Command) -> PyRes<()> {
+    Python::attach(|py| py.detach(move || cli::execute(command))).map_err(to_py)
+}
+
 /// Push files (manual mode) or detected changes (auto mode).
 #[pyfunction]
 #[pyo3(signature = (paths=None, data=None, since=None, dry_run=false, yes=false, include_models=false, config=None))]
-#[allow(clippy::too_many_arguments)]
 fn push(
-    py: Python<'_>,
     paths: Option<Vec<String>>,
     data: Option<(String, String)>,
     since: Option<f64>,
@@ -335,7 +338,7 @@ fn push(
         include_models,
         config: config_arg(config),
     };
-    py.detach(move || cli::execute(command)).map_err(to_py)
+    execute(command)
 }
 
 /// Download data to CSV / Parquet; returns the written file.
@@ -366,20 +369,14 @@ fn fetch(
 /// Delete BigQuery resources identified by local files, then the files.
 #[pyfunction]
 #[pyo3(signature = (paths, dry_run=false, yes=false, config=None))]
-fn rm(
-    py: Python<'_>,
-    paths: Vec<String>,
-    dry_run: bool,
-    yes: bool,
-    config: Option<PathBuf>,
-) -> PyRes<()> {
+fn rm(paths: Vec<String>, dry_run: bool, yes: bool, config: Option<PathBuf>) -> PyRes<()> {
     let command = Command::Rm {
         path: paths,
         dry_run,
         yes,
         config: config_arg(config),
     };
-    py.detach(move || cli::execute(command)).map_err(to_py)
+    execute(command)
 }
 
 /// Materialize a view / external table; returns the model YAML written.
@@ -408,9 +405,7 @@ fn materialize(
 /// Change (or list / resync from files) scheduled query schedules.
 #[pyfunction]
 #[pyo3(signature = (display_name=None, schedule=None, from_file=false, dry_run=false, trigger=false, list=false, config=None))]
-#[allow(clippy::too_many_arguments)]
 fn reschedule(
-    py: Python<'_>,
     display_name: Option<String>,
     schedule: Option<String>,
     from_file: bool,
@@ -433,7 +428,7 @@ fn reschedule(
         list,
         config: config_arg(config),
     };
-    py.detach(move || cli::execute(command)).map_err(to_py)
+    execute(command)
 }
 
 /// Scheduled queries (``display_name``, ``schedule``) of the project.

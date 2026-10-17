@@ -3,7 +3,7 @@
 //! Scalar columns map to typed Arrow arrays; ``REPEATED`` and ``RECORD``
 //! columns are serialised as JSON text.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -34,6 +34,15 @@ pub struct BqField {
     pub fields: Vec<BqField>,
 }
 
+/// Upper-cased column *mode*; BigQuery omits it for ``NULLABLE`` columns.
+pub fn normalize_mode(mode: &str) -> String {
+    if mode.is_empty() {
+        "NULLABLE".to_owned()
+    } else {
+        mode.to_uppercase()
+    }
+}
+
 impl BqField {
     /// Parse a REST ``schema`` object (``{"fields": [...]}``).
     pub fn from_schema(schema: Option<&Value>) -> Vec<BqField> {
@@ -49,11 +58,7 @@ impl BqField {
         BqField {
             name: s("name").to_owned(),
             field_type: s("type").to_uppercase(),
-            mode: if s("mode").is_empty() {
-                "NULLABLE".to_owned()
-            } else {
-                s("mode").to_uppercase()
-            },
+            mode: normalize_mode(s("mode")),
             fields: BqField::from_schema(Some(v)),
         }
     }
@@ -82,14 +87,17 @@ impl BqField {
     }
 }
 
-/// Convert REST rows (``[{"f": [{"v": …}, …]}, …]``) into a record batch.
-pub fn rows_to_batch(fields: &[BqField], rows: &[Value], fmt: DataFormat) -> Result<RecordBatch> {
-    let schema = Arc::new(Schema::new(
+fn arrow_schema(fields: &[BqField], fmt: DataFormat) -> Arc<Schema> {
+    Arc::new(Schema::new(
         fields
             .iter()
             .map(|f| Field::new(&f.name, f.arrow_type(fmt), true))
             .collect::<Vec<_>>(),
-    ));
+    ))
+}
+
+/// Convert REST rows (``[{"f": [{"v": …}, …]}, …]``) into a record batch.
+pub fn rows_to_batch(fields: &[BqField], rows: &[Value], fmt: DataFormat) -> Result<RecordBatch> {
     let columns = fields
         .iter()
         .enumerate()
@@ -99,7 +107,8 @@ pub fn rows_to_batch(fields: &[BqField], rows: &[Value], fmt: DataFormat) -> Res
                 .with_context(|| format!("column '{}'", field.name))
         })
         .collect::<anyhow::Result<Vec<ArrayRef>>>()?;
-    Ok(RecordBatch::try_new(schema, columns).context("failed to assemble record batch")?)
+    Ok(RecordBatch::try_new(arrow_schema(fields, fmt), columns)
+        .context("failed to assemble record batch")?)
 }
 
 fn cell(row: &Value, idx: usize) -> &Value {
@@ -268,37 +277,96 @@ fn parse_time_micros(s: &str) -> anyhow::Result<i64> {
     Ok(t.num_seconds_from_midnight() as i64 * 1_000_000 + (t.nanosecond() / 1_000) as i64)
 }
 
-/// Write *batch* to *dest* (parent directories are created).
-pub fn write_batch(batch: &RecordBatch, dest: &Path, fmt: DataFormat) -> Result<()> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
-    }
-    let file = std::fs::File::create(dest).map_err(|e| Error::io(dest, e))?;
-    match fmt {
-        DataFormat::Csv => {
-            let mut writer = arrow_csv::WriterBuilder::new()
-                .with_header(true)
-                .build(file);
-            writer.write(batch).context("failed to write CSV")?;
+enum Sink {
+    Csv(arrow_csv::Writer<std::fs::File>),
+    Parquet(parquet::arrow::ArrowWriter<std::fs::File>),
+}
+
+/// Incremental CSV / Parquet writer fed with REST row pages, so a result
+/// never has to be held in memory as a whole.
+pub struct TableWriter {
+    fields: Vec<BqField>,
+    fmt: DataFormat,
+    dest: PathBuf,
+    sink: Sink,
+}
+
+/// File that receives the rows of *dest* until [`TableWriter::finish`]
+/// renames it into place, so a failed write never replaces an existing
+/// *dest*.
+pub fn partial_path(dest: &Path) -> PathBuf {
+    let mut name = dest.as_os_str().to_owned();
+    name.push(".part");
+    PathBuf::from(name)
+}
+
+impl TableWriter {
+    /// Start writing rows of *fields* for *dest* (parent directories
+    /// included).
+    pub fn create(fields: Vec<BqField>, dest: &Path, fmt: DataFormat) -> Result<Self> {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
         }
-        DataFormat::Parquet => {
-            let props = parquet::file::properties::WriterProperties::builder()
-                .set_compression(parquet::basic::Compression::ZSTD(Default::default()))
-                .build();
-            let mut writer =
-                parquet::arrow::ArrowWriter::try_new(file, batch.schema(), Some(props))
-                    .context("failed to create Parquet writer")?;
-            writer.write(batch).context("failed to write Parquet")?;
-            writer.close().context("failed to finish Parquet file")?;
-        }
+        let partial = partial_path(dest);
+        let file = std::fs::File::create(&partial).map_err(|e| Error::io(&partial, e))?;
+        let schema = arrow_schema(&fields, fmt);
+        let sink = match fmt {
+            DataFormat::Csv => {
+                let mut writer = arrow_csv::WriterBuilder::new()
+                    .with_header(true)
+                    .build(file);
+                // The header is emitted with the first batch, even an empty one.
+                writer
+                    .write(&RecordBatch::new_empty(schema))
+                    .context("failed to write CSV")?;
+                Sink::Csv(writer)
+            }
+            DataFormat::Parquet => {
+                let props = parquet::file::properties::WriterProperties::builder()
+                    .set_compression(parquet::basic::Compression::ZSTD(Default::default()))
+                    .build();
+                Sink::Parquet(
+                    parquet::arrow::ArrowWriter::try_new(file, schema, Some(props))
+                        .context("failed to create Parquet writer")?,
+                )
+            }
+        };
+        Ok(TableWriter {
+            fields,
+            fmt,
+            dest: dest.to_owned(),
+            sink,
+        })
     }
-    Ok(())
+
+    /// Append one page of REST rows.
+    pub fn write_rows(&mut self, rows: &[Value]) -> Result<()> {
+        let batch = rows_to_batch(&self.fields, rows, self.fmt)?;
+        match &mut self.sink {
+            Sink::Csv(w) => w.write(&batch).context("failed to write CSV")?,
+            Sink::Parquet(w) => w.write(&batch).context("failed to write Parquet")?,
+        }
+        Ok(())
+    }
+
+    /// Flush, close and move the file to its destination.
+    pub fn finish(self) -> Result<()> {
+        match self.sink {
+            Sink::Csv(w) => drop(w),
+            Sink::Parquet(w) => {
+                w.close().context("failed to finish Parquet file")?;
+            }
+        }
+        let partial = partial_path(&self.dest);
+        std::fs::rename(&partial, &self.dest).map_err(|e| Error::io(&self.dest, e))
+    }
 }
 
 /// Convert REST rows and write them to *dest*.
 pub fn write_rows(fields: &[BqField], rows: &[Value], dest: &Path, fmt: DataFormat) -> Result<()> {
-    let batch = rows_to_batch(fields, rows, fmt)?;
-    write_batch(&batch, dest, fmt)
+    let mut writer = TableWriter::create(fields.to_vec(), dest, fmt)?;
+    writer.write_rows(rows)?;
+    writer.finish()
 }
 
 #[cfg(test)]
@@ -393,6 +461,50 @@ mod tests {
             .unwrap();
         let total: usize = reader.map(|b| b.unwrap().num_rows()).sum();
         assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn pages_are_appended_to_one_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for (fmt, name) in [
+            (DataFormat::Csv, "p.csv"),
+            (DataFormat::Parquet, "p.parquet"),
+        ] {
+            let dest = dir.path().join(name);
+            let mut writer = TableWriter::create(schema(), &dest, fmt).unwrap();
+            writer.write_rows(&rows()[..1]).unwrap();
+            writer.write_rows(&rows()[1..]).unwrap();
+            writer.finish().unwrap();
+            let total = match fmt {
+                DataFormat::Csv => {
+                    let text = std::fs::read_to_string(&dest).unwrap();
+                    assert_eq!(text.matches("id,name").count(), 1);
+                    text.lines().count() - 1
+                }
+                DataFormat::Parquet => {
+                    let file = std::fs::File::open(&dest).unwrap();
+                    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                        .unwrap()
+                        .build()
+                        .unwrap()
+                        .map(|b| b.unwrap().num_rows())
+                        .sum()
+                }
+            };
+            assert_eq!(total, 2);
+        }
+    }
+
+    #[test]
+    fn unfinished_write_keeps_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.csv");
+        std::fs::write(&dest, "old").unwrap();
+        let mut writer = TableWriter::create(schema(), &dest, DataFormat::Csv).unwrap();
+        writer.write_rows(&rows()).unwrap();
+        drop(writer);
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "old");
+        assert!(partial_path(&dest).exists());
     }
 
     #[test]

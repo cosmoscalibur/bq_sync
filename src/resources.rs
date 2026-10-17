@@ -43,6 +43,15 @@ impl Default for RoutineArgument {
     }
 }
 
+/// Routine body and, when known, the signature used to create it.
+#[derive(Debug, Clone, Copy)]
+pub struct RoutineDefinition<'a> {
+    pub body: &'a str,
+    pub language: &'a str,
+    pub arguments: Option<&'a [RoutineArgument]>,
+    pub return_type: Option<&'a str>,
+}
+
 /// A BigQuery view definition.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewInfo {
@@ -131,6 +140,17 @@ pub struct TransferConfig {
     pub update_time: Option<DateTime<Utc>>,
 }
 
+impl From<TransferConfig> for ScheduledQueryInfo {
+    fn from(tc: TransferConfig) -> Self {
+        ScheduledQueryInfo {
+            name: tc.display_name,
+            sql: tc.query,
+            schedule: tc.schedule,
+            modified: tc.update_time.unwrap_or(EPOCH),
+        }
+    }
+}
+
 /// Tabular output format for data fetch / load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataFormat {
@@ -155,4 +175,22 @@ impl DataFormat {
             ))),
         }
     }
+}
+
+/// Tables, views, routines and external tables of one dataset.
+#[derive(Debug, Clone, Default)]
+pub struct DatasetResources {
+    pub views: Vec<ViewInfo>,
+    pub routines: Vec<RoutineInfo>,
+    pub tables: Vec<TableInfo>,
+    pub externals: Vec<ExternalTableInfo>,
+}
+
+/// Everything ``pull`` reads from BigQuery for one project.
+#[derive(Debug, Clone, Default)]
+pub struct PullListing {
+    /// One entry per requested dataset, in request order.
+    pub datasets: Vec<DatasetResources>,
+    pub scheduled: Vec<ScheduledQueryInfo>,
+    pub saved: Vec<SavedQueryInfo>,
 }

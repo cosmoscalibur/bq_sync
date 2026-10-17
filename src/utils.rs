@@ -20,6 +20,21 @@ pub fn stem(name: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Longest file name stem, in bytes, that fits common filesystem limits
+/// together with an extension.
+const MAX_STEM_BYTES: usize = 200;
+
+/// File name stem for the free-text resource *name*: the characters a path
+/// cannot hold are replaced so the file stays inside the directory it is
+/// joined to, and the stem is cut to [`MAX_STEM_BYTES`].
+pub fn file_stem_of(name: &str) -> String {
+    let mut stem = name.replace(['/', '\\', '\0'], "_");
+    while stem.len() > MAX_STEM_BYTES {
+        stem.pop();
+    }
+    stem
+}
+
 /// Parse a CLI resource path into ``(project, dataset, name)``.
 ///
 /// Accepted forms:
@@ -236,6 +251,15 @@ mod tests {
         assert_eq!(py_repr("x {"), "'x {'");
         assert_eq!(py_repr("it's"), "\"it's\"");
         assert_eq!(py_repr("a\nb"), "'a\\nb'");
+    }
+
+    #[test]
+    fn file_stem_of_drops_separators() {
+        assert_eq!(file_stem_of("daily load"), "daily load");
+        assert_eq!(file_stem_of("a/b\\c"), "a_b_c");
+        assert_eq!(file_stem_of("../x"), ".._x");
+        assert_eq!(file_stem_of("a\nb\0c"), "a\nb_c");
+        assert_eq!(file_stem_of(&"é".repeat(150)).len(), 200);
     }
 
     #[test]

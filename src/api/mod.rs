@@ -14,8 +14,8 @@ pub use gcp::GcpClient;
 
 use crate::error::Result;
 use crate::resources::{
-    DataFormat, ExternalTableInfo, RoutineArgument, RoutineInfo, SavedQueryInfo,
-    ScheduledQueryInfo, TableInfo, TransferConfig, ViewInfo,
+    DataFormat, DatasetResources, ExternalTableInfo, PullListing, RoutineDefinition, RoutineInfo,
+    SavedQueryInfo, ScheduledQueryInfo, TableInfo, TransferConfig, ViewInfo,
 };
 
 /// Operations bq-sync performs against Google Cloud.
@@ -28,7 +28,8 @@ pub trait BqApi {
     fn get_table_info(&self, project: &str, dataset: &str, name: &str) -> Result<TableInfo>;
 
     /// Saved queries via Dataform.  Returns an empty list (with a warning)
-    /// when Dataform is unavailable.
+    /// when Dataform is not enabled or not accessible; other failures are
+    /// errors.
     fn list_saved_queries(&self, project: &str, region: &str) -> Result<Vec<SavedQueryInfo>>;
 
     // ----- scheduled queries (Data Transfer) -----
@@ -58,26 +59,31 @@ pub trait BqApi {
         Ok(self
             .list_transfer_configs(project, region)?
             .into_iter()
-            .map(|tc| ScheduledQueryInfo {
-                name: tc.display_name,
-                sql: tc.query,
-                schedule: tc.schedule,
-                modified: tc.update_time.unwrap_or(crate::resources::EPOCH),
-            })
+            .map(ScheduledQueryInfo::from)
             .collect())
     }
 
-    /// First scheduled query whose display name matches exactly.
+    /// The scheduled query whose display name matches exactly.
+    ///
+    /// Display names are not unique in BigQuery; several matches are an
+    /// error because the target of an update would be ambiguous.
     fn get_transfer_config(
         &self,
         project: &str,
         region: &str,
         display_name: &str,
     ) -> Result<Option<TransferConfig>> {
-        Ok(self
+        let mut matches = self
             .list_transfer_configs(project, region)?
             .into_iter()
-            .find(|tc| tc.display_name == display_name))
+            .filter(|tc| tc.display_name == display_name);
+        let found = matches.next();
+        if matches.next().is_some() {
+            return Err(crate::Error::Invalid(format!(
+                "Several scheduled queries are named '{display_name}' in {project}/{region}."
+            )));
+        }
+        Ok(found)
     }
 
     /// Update the schedule of the scheduled query named *display_name*.
@@ -130,6 +136,33 @@ pub trait BqApi {
         Ok(())
     }
 
+    /// Everything ``pull`` reads: the resources of each of *datasets* plus
+    /// the project-level scheduled and saved queries.  Implementations may
+    /// fetch the parts concurrently.
+    fn list_pull_resources(
+        &self,
+        project: &str,
+        region: &str,
+        datasets: &[String],
+    ) -> Result<PullListing> {
+        let datasets = datasets
+            .iter()
+            .map(|d| {
+                Ok(DatasetResources {
+                    views: self.list_views(project, d)?,
+                    routines: self.list_routines(project, d)?,
+                    tables: self.list_tables(project, d)?,
+                    externals: self.list_external_tables(project, d)?,
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(PullListing {
+            datasets,
+            scheduled: self.list_scheduled_queries(project, region)?,
+            saved: self.list_saved_queries(project, region)?,
+        })
+    }
+
     // ----- data -----
     fn fetch_table_to_file(
         &self,
@@ -165,16 +198,14 @@ pub trait BqApi {
         description: &str,
         field_descriptions: &HashMap<String, String>,
     ) -> Result<()>;
-    #[allow(clippy::too_many_arguments)]
+    /// Replace the body of routine *name*; the signature in *definition* is
+    /// used only when the routine has to be created.
     fn upsert_routine(
         &self,
         project: &str,
         dataset: &str,
         name: &str,
-        body: &str,
-        language: &str,
-        arguments: Option<&[RoutineArgument]>,
-        return_type: Option<&str>,
+        definition: &RoutineDefinition,
     ) -> Result<()>;
     fn upsert_routine_description(
         &self,

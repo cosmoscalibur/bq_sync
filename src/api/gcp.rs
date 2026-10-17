@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
@@ -35,11 +35,12 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, OnceCell};
 
 use super::BqApi;
-use super::tabular::{self, BqField};
+use super::tabular::{self, BqField, TableWriter, normalize_mode};
 use crate::error::{Error, Result};
 use crate::resources::{
-    DataFormat, EPOCH, ExternalTableInfo, RoutineArgument, RoutineInfo, SavedQueryInfo,
-    SchemaField, TableInfo, TransferConfig, ViewInfo,
+    DataFormat, DatasetResources, EPOCH, ExternalTableInfo, PullListing, RoutineArgument,
+    RoutineDefinition, RoutineInfo, SavedQueryInfo, ScheduledQueryInfo, SchemaField, TableInfo,
+    TransferConfig, ViewInfo,
 };
 
 const BQ_REST: &str = "https://bigquery.googleapis.com/bigquery/v2";
@@ -48,6 +49,8 @@ const BQ_UPLOAD: &str = "https://bigquery.googleapis.com/upload/bigquery/v2";
 /// Maximum concurrent per-resource metadata requests while listing.
 const CONCURRENCY: usize = 8;
 const QUERY_TIMEOUT_MS: u32 = 10_000;
+/// Longest a load job may take, from the start of its upload to DONE.
+const LOAD_JOB_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Drain an SDK item paginator into a vector.
 macro_rules! collect_items {
@@ -78,6 +81,11 @@ pub struct GcpClient {
     /// so one client per project is kept.
     transfer: Mutex<HashMap<String, DataTransferService>>,
     dataform: Mutex<HashMap<String, Dataform>>,
+    /// Listings reused across the per-file lookups of a push, keyed by
+    /// (project, region).  A transfer config write updates its cached entry;
+    /// a repository write clears the repository listing.
+    transfer_configs: StdMutex<HashMap<(String, String), Vec<TransferConfig>>>,
+    repositories: StdMutex<HashMap<(String, String), Vec<df::Repository>>>,
     token: OnceCell<AccessTokenCredentials>,
     http: reqwest::Client,
 }
@@ -91,6 +99,7 @@ impl GcpClient {
             .context("failed to start async runtime")?;
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
+            .read_timeout(Duration::from_secs(120))
             .user_agent(concat!("bq-sync/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("failed to build HTTP client")?;
@@ -99,6 +108,8 @@ impl GcpClient {
             bigquery: OnceCell::new(),
             transfer: Mutex::new(HashMap::new()),
             dataform: Mutex::new(HashMap::new()),
+            transfer_configs: StdMutex::default(),
+            repositories: StdMutex::default(),
             token: OnceCell::new(),
             http,
         })
@@ -203,6 +214,37 @@ impl GcpClient {
             .map_err(gax_error)
     }
 
+    /// ``(type, table id)`` of every table of the dataset.
+    async fn list_table_refs(&self, project: &str, dataset: &str) -> Result<Vec<(String, String)>> {
+        let listed: Vec<bq::ListFormatTable> = collect_items!(
+            self.bq()
+                .await?
+                .tables
+                .list_tables()
+                .set_project_id(project)
+                .set_dataset_id(dataset)
+                .by_item()
+        );
+        Ok(listed
+            .into_iter()
+            .filter_map(|t| t.table_reference.map(|r| (t.r#type, r.table_id)))
+            .collect())
+    }
+
+    /// Full metadata of the tables *ids*, fetched concurrently.
+    async fn get_tables(
+        &self,
+        project: &str,
+        dataset: &str,
+        ids: Vec<String>,
+    ) -> Result<Vec<bq::Table>> {
+        stream::iter(ids)
+            .map(|id: String| async move { self.get_table(project, dataset, &id).await })
+            .buffered(CONCURRENCY)
+            .try_collect()
+            .await
+    }
+
     /// Full metadata of every table of *kind* (``VIEW``, ``TABLE``, …).
     async fn tables_of_type(
         &self,
@@ -210,24 +252,64 @@ impl GcpClient {
         dataset: &str,
         kind: &str,
     ) -> Result<Vec<bq::Table>> {
-        let tables = &self.bq().await?.tables;
-        let listed: Vec<bq::ListFormatTable> = collect_items!(
-            tables
-                .list_tables()
+        let ids = self
+            .list_table_refs(project, dataset)
+            .await?
+            .into_iter()
+            .filter(|(t, _)| t == kind)
+            .map(|(_, id)| id)
+            .collect();
+        self.get_tables(project, dataset, ids).await
+    }
+
+    /// Full metadata of every routine of the dataset, fetched concurrently.
+    async fn routines_of(&self, project: &str, dataset: &str) -> Result<Vec<bq::Routine>> {
+        let listed: Vec<bq::Routine> = collect_items!(
+            self.bq()
+                .await?
+                .routines
+                .list_routines()
                 .set_project_id(project)
                 .set_dataset_id(dataset)
                 .by_item()
         );
-        let ids: Vec<String> = listed
-            .into_iter()
-            .filter(|t| t.r#type == kind)
-            .filter_map(|t| t.table_reference.map(|r| r.table_id))
-            .collect();
-        stream::iter(ids)
-            .map(|id: String| async move { self.get_table(project, dataset, &id).await })
-            .buffered(CONCURRENCY)
-            .try_collect()
-            .await
+        stream::iter(
+            listed
+                .into_iter()
+                .filter_map(|r| r.routine_reference.map(|r| r.routine_id)),
+        )
+        .map(|id: String| async move { self.get_routine(project, dataset, &id).await })
+        .buffered(CONCURRENCY)
+        .try_collect()
+        .await
+    }
+
+    /// Views, routines, tables and external tables of the dataset; the
+    /// table listing is shared and the routine and table lookups overlap.
+    async fn dataset_resources(&self, project: &str, dataset: &str) -> Result<DatasetResources> {
+        let tables = async {
+            let ids = self
+                .list_table_refs(project, dataset)
+                .await?
+                .into_iter()
+                .filter(|(kind, _)| matches!(kind.as_str(), "VIEW" | "TABLE" | "EXTERNAL"))
+                .map(|(_, id)| id)
+                .collect();
+            self.get_tables(project, dataset, ids).await
+        };
+        let (tables, routines) = tokio::try_join!(tables, self.routines_of(project, dataset))?;
+        let mut resources = DatasetResources {
+            routines: routines.iter().map(routine_info).collect(),
+            ..Default::default()
+        };
+        for t in &tables {
+            match t.r#type.as_str() {
+                "VIEW" => resources.views.push(view_info(t)),
+                "TABLE" => resources.tables.push(table_info(t)),
+                _ => resources.externals.push(external_table_info(t)),
+            }
+        }
+        Ok(resources)
     }
 
     async fn get_routine(
@@ -315,9 +397,9 @@ impl GcpClient {
         description: &str,
         field_descriptions: &HashMap<String, String>,
     ) -> Result<()> {
-        let table = self.get_table(project, dataset, name).await?;
         let mut patch = bq::Table::new().set_description(description);
         if !field_descriptions.is_empty() {
+            let table = self.get_table(project, dataset, name).await?;
             let mut schema = table.schema.unwrap_or_default();
             for field in &mut schema.fields {
                 if let Some(desc) = field_descriptions.get(&field.name) {
@@ -355,16 +437,12 @@ impl GcpClient {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn create_routine(
         &self,
         project: &str,
         dataset: &str,
         name: &str,
-        body: &str,
-        language: &str,
-        arguments: Option<&[RoutineArgument]>,
-        return_type: Option<&str>,
+        definition: &RoutineDefinition<'_>,
     ) -> Result<()> {
         let mut routine = bq::Routine::new()
             .set_routine_reference(
@@ -373,16 +451,16 @@ impl GcpClient {
                     .set_dataset_id(dataset)
                     .set_routine_id(name),
             )
-            .set_definition_body(body)
-            .set_language(bq::routine::Language::from(language));
-        if let Some(args) = arguments.filter(|a| !a.is_empty()) {
+            .set_definition_body(definition.body)
+            .set_language(bq::routine::Language::from(definition.language));
+        if let Some(args) = definition.arguments.filter(|a| !a.is_empty()) {
             routine = routine.set_arguments(args.iter().map(|a| {
                 bq::routine::Argument::new()
                     .set_name(&a.name)
                     .set_data_type(sql_type(&a.arg_type))
             }));
         }
-        if let Some(rt) = return_type.filter(|r| !r.is_empty()) {
+        if let Some(rt) = definition.return_type.filter(|r| !r.is_empty()) {
             routine = routine.set_return_type(sql_type(rt));
         }
         self.bq()
@@ -407,6 +485,7 @@ impl GcpClient {
         bq::DataFormatOptions::new().set_use_int64_timestamp(true)
     }
 
+    /// Fetch a job, failing when it finished with an error.
     async fn get_job(&self, project: &str, job_id: &str, location: &str) -> Result<bq::Job> {
         let job = self
             .bq()
@@ -420,12 +499,30 @@ impl GcpClient {
             .await
             .map_err(gax_error)?;
         if let Some(err) = job.status.as_ref().and_then(|s| s.error_result.as_ref()) {
-            return Err(Error::Api {
-                status: 400,
-                message: err.message.clone(),
-            });
+            return Err(anyhow!("job {job_id} failed: {}", err.message).into());
         }
         Ok(job)
+    }
+
+    /// Ask BigQuery to cancel a job; a failure is logged because the caller
+    /// is already reporting the error that led here.
+    async fn cancel_job(&self, project: &str, job_id: &str, location: &str) {
+        let result = async {
+            self.bq()
+                .await?
+                .jobs
+                .cancel_job()
+                .set_project_id(project)
+                .set_job_id(job_id)
+                .set_location(location)
+                .send()
+                .await
+                .map_err(gax_error)
+        }
+        .await;
+        if let Err(e) = result {
+            log::warn!("Could not cancel job {job_id}: {e}");
+        }
     }
 
     async fn query_results(
@@ -450,13 +547,16 @@ impl GcpClient {
             .map_err(gax_error)
     }
 
-    /// Run *sql*, wait for completion and return the schema and all rows.
+    /// Run *sql*, wait for completion and hand every page of rows to
+    /// *on_page* together with the result schema.  *on_page* runs at least
+    /// once, even for an empty result.
     async fn run_sql(
         &self,
         project: &str,
         sql: &str,
         location: Option<&str>,
-    ) -> Result<(Vec<BqField>, Vec<Value>)> {
+        mut on_page: impl FnMut(&[BqField], Vec<Value>) -> Result<()>,
+    ) -> Result<()> {
         let mut request = bq::QueryRequest::new()
             .set_query(sql)
             .set_use_legacy_sql(false)
@@ -496,23 +596,28 @@ impl GcpClient {
             }
         }
         self.get_job(project, &job_id, &location).await?;
+        let fields = fields_of(schema.as_ref());
+        on_page(&fields, rows.into_iter().map(Value::Object).collect())?;
         while !page_token.is_empty() {
             let page = self
                 .query_results(project, &job_id, &location, &page_token)
                 .await?;
-            rows.extend(page.rows);
+            on_page(&fields, page.rows.into_iter().map(Value::Object).collect())?;
             page_token = page.page_token;
         }
-        Ok((
-            fields_of(schema.as_ref()),
-            rows.into_iter().map(Value::Object).collect(),
-        ))
+        Ok(())
     }
 
-    /// ``tabledata.list`` (not in the SDK): free, paginated row reads.
-    async fn table_rows(&self, project: &str, dataset: &str, table: &str) -> Result<Vec<Value>> {
+    /// ``tabledata.list`` (not in the SDK): free, paginated row reads, one
+    /// call to *on_page* per page.
+    async fn table_rows(
+        &self,
+        project: &str,
+        dataset: &str,
+        table: &str,
+        mut on_page: impl FnMut(&[Value]) -> Result<()>,
+    ) -> Result<()> {
         let url = format!("{BQ_REST}/projects/{project}/datasets/{dataset}/tables/{table}/data");
-        let mut rows = Vec::new();
         let mut token: Option<String> = None;
         loop {
             let mut q = vec![("formatOptions.useInt64Timestamp", "true")];
@@ -525,18 +630,26 @@ impl GcpClient {
                 .bearer_auth(self.access_token().await?)
                 .query(&q);
             let page = send_json(req).await?;
-            if let Some(r) = page.get("rows").and_then(Value::as_array) {
-                rows.extend(r.iter().cloned());
+            if let Some(rows) = page.get("rows").and_then(Value::as_array) {
+                on_page(rows)?;
             }
             match page.get("pageToken").and_then(Value::as_str) {
                 Some(t) if !t.is_empty() => token = Some(t.to_owned()),
-                _ => return Ok(rows),
+                _ => return Ok(()),
             }
         }
     }
 
     /// Resumable media upload (not in the SDK) creating a load job.
-    async fn upload_load_job(&self, project: &str, config: &Value, data: Vec<u8>) -> Result<Value> {
+    async fn upload_load_job(&self, project: &str, config: &Value, source: &Path) -> Result<Value> {
+        let file = tokio::fs::File::open(source)
+            .await
+            .map_err(|e| Error::io(source, e))?;
+        let len = file
+            .metadata()
+            .await
+            .map_err(|e| Error::io(source, e))?
+            .len();
         let url = format!("{BQ_UPLOAD}/projects/{project}/jobs");
         let token = self.access_token().await?;
         let resp = self
@@ -565,9 +678,70 @@ impl GcpClient {
                 .request(Method::PUT, &session)
                 .bearer_auth(&token)
                 .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-                .body(data),
+                .header(reqwest::header::CONTENT_LENGTH, len)
+                .body(file),
         )
         .await
+    }
+
+    // ------------------------------------------------------------------
+    // Data Transfer (scheduled queries)
+    // ------------------------------------------------------------------
+
+    /// Scheduled-query transfer configs of the project and region.
+    async fn scheduled_transfer_configs(
+        &self,
+        project: &str,
+        region: &str,
+    ) -> Result<Vec<TransferConfig>> {
+        let key = (project.to_owned(), region.to_owned());
+        if let Some(configs) = self.transfer_configs.lock().unwrap().get(&key) {
+            return Ok(configs.clone());
+        }
+        let client = self.transfer(project).await?;
+        let listed: Vec<dts::TransferConfig> = collect_items!(
+            client
+                .list_transfer_configs()
+                .set_parent(format!("projects/{project}/locations/{region}"))
+                .set_data_source_ids(["scheduled_query"])
+                .by_item()
+        );
+        let configs: Vec<TransferConfig> = listed
+            .into_iter()
+            .filter(|tc| tc.data_source_id == "scheduled_query")
+            .map(|tc| TransferConfig {
+                query: tc
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("query"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                update_time: tc
+                    .update_time
+                    .as_ref()
+                    .and_then(|t| DateTime::from_timestamp(t.seconds(), t.nanos() as u32)),
+                name: tc.name,
+                display_name: tc.display_name,
+                schedule: tc.schedule,
+                data_source_id: tc.data_source_id,
+            })
+            .collect();
+        self.transfer_configs
+            .lock()
+            .unwrap()
+            .insert(key, configs.clone());
+        Ok(configs)
+    }
+
+    /// Apply a successful update to the cached copies of transfer config
+    /// *name*, so later lookups in the same run see it without re-listing.
+    fn update_cached_transfer_config(&self, name: &str, update: impl Fn(&mut TransferConfig)) {
+        let mut cache = self.transfer_configs.lock().unwrap();
+        for tc in cache.values_mut().flatten().filter(|tc| tc.name == name) {
+            update(tc);
+            tc.update_time = Some(Utc::now());
+        }
     }
 
     // ------------------------------------------------------------------
@@ -575,13 +749,19 @@ impl GcpClient {
     // ------------------------------------------------------------------
 
     async fn list_repositories(&self, project: &str, region: &str) -> Result<Vec<df::Repository>> {
+        let key = (project.to_owned(), region.to_owned());
+        if let Some(repos) = self.repositories.lock().unwrap().get(&key) {
+            return Ok(repos.clone());
+        }
         let client = self.dataform(project).await?;
-        Ok(collect_items!(
+        let repos: Vec<df::Repository> = collect_items!(
             client
                 .list_repositories()
                 .set_parent(format!("projects/{project}/locations/{region}"))
                 .by_item()
-        ))
+        );
+        self.repositories.lock().unwrap().insert(key, repos.clone());
+        Ok(repos)
     }
 
     async fn find_repository(
@@ -641,56 +821,73 @@ impl GcpClient {
         Ok(())
     }
 
-    async fn list_saved_queries_inner(
+    /// The saved query stored in *repo*, or ``None`` when the repository has
+    /// no saved query or cannot be read; one unreadable repository must not
+    /// fail the whole listing.
+    async fn read_saved_query(
         &self,
         project: &str,
-        region: &str,
-    ) -> Result<Vec<SavedQueryInfo>> {
-        let mut saved = Vec::new();
-        for repo in self.list_repositories(project, region).await? {
-            if repo.display_name.is_empty() {
-                continue;
+        repo: df::Repository,
+    ) -> Option<SavedQueryInfo> {
+        let display = repo.display_name;
+        let sql = match self.first_workspace(project, &repo.name).await {
+            Ok(Some(ws)) => self.read_saved_sql(project, &ws).await,
+            Ok(None) => return None,
+            Err(e) => Err(e),
+        };
+        match sql {
+            Ok(sql) => Some(SavedQueryInfo {
+                name: display,
+                sql,
+                modified: EPOCH,
+            }),
+            Err(e) if e.is_not_found() => {
+                log::debug!("No saved query content in repo '{display}'.");
+                None
             }
-            let display = repo.display_name;
-            let ws = match self.first_workspace(project, &repo.name).await {
-                Ok(Some(ws)) => ws,
-                Ok(None) => continue,
-                Err(_) => {
-                    log::debug!("Cannot list workspaces for repo '{display}'.");
-                    continue;
-                }
-            };
-            match self.read_saved_sql(project, &ws).await {
-                Ok(sql) => saved.push(SavedQueryInfo {
-                    name: display,
-                    sql,
-                    modified: EPOCH,
-                }),
-                Err(_) => log::debug!("Cannot read content.sql in repo '{display}'."),
+            Err(e) => {
+                log::warn!("Cannot read saved query '{display}': {e}");
+                None
             }
         }
-        Ok(saved)
     }
 
-    async fn update_saved_query(
-        &self,
-        project: &str,
-        region: &str,
-        name: &str,
-        sql: &str,
-    ) -> Result<()> {
-        let mut workspace = None;
-        if let Some(repo) = self.find_repository(project, region, name).await? {
-            workspace = self.first_workspace(project, &repo.name).await?;
-        }
-        let Some(ws) = workspace else {
-            return Err(Error::Invalid(format!(
-                "Saved query '{name}' not found in project '{project}' region '{region}'."
-            )));
+    /// Saved queries of every named repository, read concurrently.  An
+    /// unavailable Dataform API yields an empty list; other failures are
+    /// errors.
+    async fn saved_queries(&self, project: &str, region: &str) -> Result<Vec<SavedQueryInfo>> {
+        let repos = match self.list_repositories(project, region).await {
+            Ok(repos) => repos,
+            Err(e) if e.is_not_found() || e.is_permission_denied() => {
+                log::warn!(
+                    "Failed to list saved queries via Dataform API. \
+                     Dataform may not be enabled for project '{project}'. ({e})"
+                );
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e),
         };
-        self.write_saved_sql(project, &ws, sql).await?;
-        log::info!("Updated saved query '{name}'");
-        Ok(())
+        let saved: Vec<Option<SavedQueryInfo>> =
+            stream::iter(repos.into_iter().filter(|r| !r.display_name.is_empty()))
+                .map(|repo| async move { self.read_saved_query(project, repo).await })
+                .buffered(CONCURRENCY)
+                .collect()
+                .await;
+        Ok(saved.into_iter().flatten().collect())
+    }
+
+    async fn create_default_workspace(&self, project: &str, repo: &str) -> Result<String> {
+        let ws = self
+            .dataform(project)
+            .await?
+            .create_workspace()
+            .set_parent(repo)
+            .set_workspace(df::Workspace::new())
+            .set_workspace_id("default")
+            .send()
+            .await
+            .map_err(gax_error)?;
+        Ok(ws.name)
     }
 
     async fn create_saved_query(
@@ -700,8 +897,9 @@ impl GcpClient {
         name: &str,
         sql: &str,
     ) -> Result<()> {
-        let client = self.dataform(project).await?;
-        let repo = client
+        let repo = self
+            .dataform(project)
+            .await?
             .create_repository()
             .set_parent(format!("projects/{project}/locations/{region}"))
             .set_repository(df::Repository::new().set_display_name(name))
@@ -709,16 +907,32 @@ impl GcpClient {
             .send()
             .await
             .map_err(gax_error)?;
-        let ws = client
-            .create_workspace()
-            .set_parent(&repo.name)
-            .set_workspace(df::Workspace::new())
-            .set_workspace_id("default")
-            .send()
-            .await
-            .map_err(gax_error)?;
-        self.write_saved_sql(project, &ws.name, sql).await?;
+        self.repositories.lock().unwrap().clear();
+        let ws = self.create_default_workspace(project, &repo.name).await?;
+        self.write_saved_sql(project, &ws, sql).await?;
         log::info!("Created saved query '{name}'");
+        Ok(())
+    }
+
+    /// Write *sql* to the saved query *name*, creating the repository (or
+    /// just its workspace) when missing.
+    async fn upsert_saved_query_inner(
+        &self,
+        project: &str,
+        region: &str,
+        name: &str,
+        sql: &str,
+    ) -> Result<()> {
+        let Some(repo) = self.find_repository(project, region, name).await? else {
+            log::info!("Saved query '{name}' not found — creating.");
+            return self.create_saved_query(project, region, name, sql).await;
+        };
+        let ws = match self.first_workspace(project, &repo.name).await? {
+            Some(ws) => ws,
+            None => self.create_default_workspace(project, &repo.name).await?,
+        };
+        self.write_saved_sql(project, &ws, sql).await?;
+        log::info!("Updated saved query '{name}'");
         Ok(())
     }
 }
@@ -726,41 +940,12 @@ impl GcpClient {
 impl BqApi for GcpClient {
     fn list_views(&self, project: &str, dataset: &str) -> Result<Vec<ViewInfo>> {
         let tables = self.block_on(self.tables_of_type(project, dataset, "VIEW"))?;
-        Ok(tables
-            .into_iter()
-            .map(|t| ViewInfo {
-                name: table_id(&t),
-                sql: t.view.as_ref().map(|v| v.query.clone()).unwrap_or_default(),
-                modified: from_millis(t.last_modified_time as i64).unwrap_or(EPOCH),
-                schema: schema_fields(t.schema.as_ref()),
-                description: t.description.clone().unwrap_or_default(),
-                created: from_millis(t.creation_time),
-                region: Some(t.location.clone()).filter(|l| !l.is_empty()),
-            })
-            .collect())
+        Ok(tables.iter().map(view_info).collect())
     }
 
     fn list_routines(&self, project: &str, dataset: &str) -> Result<Vec<RoutineInfo>> {
-        self.block_on(async {
-            let routines = &self.bq().await?.routines;
-            let listed: Vec<bq::Routine> = collect_items!(
-                routines
-                    .list_routines()
-                    .set_project_id(project)
-                    .set_dataset_id(dataset)
-                    .by_item()
-            );
-            let ids: Vec<String> = listed
-                .into_iter()
-                .filter_map(|r| r.routine_reference.map(|r| r.routine_id))
-                .collect();
-            let routines: Vec<bq::Routine> = stream::iter(ids)
-                .map(|id: String| async move { self.get_routine(project, dataset, &id).await })
-                .buffered(CONCURRENCY)
-                .try_collect()
-                .await?;
-            Ok(routines.iter().map(routine_info).collect())
-        })
+        let routines = self.block_on(self.routines_of(project, dataset))?;
+        Ok(routines.iter().map(routine_info).collect())
     }
 
     fn list_tables(&self, project: &str, dataset: &str) -> Result<Vec<TableInfo>> {
@@ -770,28 +955,7 @@ impl BqApi for GcpClient {
 
     fn list_external_tables(&self, project: &str, dataset: &str) -> Result<Vec<ExternalTableInfo>> {
         let tables = self.block_on(self.tables_of_type(project, dataset, "EXTERNAL"))?;
-        Ok(tables
-            .iter()
-            .map(|t| {
-                let info = table_info(t);
-                let ext = t.external_data_configuration.as_ref();
-                ExternalTableInfo {
-                    name: info.name,
-                    source_uris: ext.map(|e| e.source_uris.clone()).unwrap_or_default(),
-                    schema: info.schema,
-                    source_format: ext.map(|e| e.source_format.clone()).unwrap_or_default(),
-                    modified: info.modified,
-                    description: info.description,
-                    created: info.created,
-                    region: info.region,
-                    total_logical_bytes: info.total_logical_bytes,
-                    row_count: info.row_count,
-                    partitioning: info.partitioning,
-                    clustering: info.clustering,
-                    primary_keys: info.primary_keys,
-                }
-            })
-            .collect())
+        Ok(tables.iter().map(external_table_info).collect())
     }
 
     fn get_table_info(&self, project: &str, dataset: &str, name: &str) -> Result<TableInfo> {
@@ -800,54 +964,44 @@ impl BqApi for GcpClient {
     }
 
     fn list_saved_queries(&self, project: &str, region: &str) -> Result<Vec<SavedQueryInfo>> {
-        log::warn!(
-            "Saved queries use the Dataform API which is an unstable feature. \
-             Results may be incomplete or change without notice."
-        );
-        match self.block_on(self.list_saved_queries_inner(project, region)) {
-            Ok(saved) => Ok(saved),
-            Err(e) => {
-                log::warn!(
-                    "Failed to list saved queries via Dataform API. \
-                     Dataform may not be enabled for project '{project}'. ({e})"
-                );
-                Ok(Vec::new())
-            }
-        }
+        self.block_on(self.saved_queries(project, region))
+    }
+
+    fn list_pull_resources(
+        &self,
+        project: &str,
+        region: &str,
+        datasets: &[String],
+    ) -> Result<PullListing> {
+        self.block_on(async {
+            let datasets = async {
+                let mut listed = Vec::with_capacity(datasets.len());
+                for dataset in datasets {
+                    listed.push(self.dataset_resources(project, dataset).await?);
+                }
+                Ok::<_, Error>(listed)
+            };
+            let scheduled = async {
+                let configs = self.scheduled_transfer_configs(project, region).await?;
+                Ok::<_, Error>(
+                    configs
+                        .into_iter()
+                        .map(ScheduledQueryInfo::from)
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let (datasets, scheduled, saved) =
+                tokio::try_join!(datasets, scheduled, self.saved_queries(project, region))?;
+            Ok(PullListing {
+                datasets,
+                scheduled,
+                saved,
+            })
+        })
     }
 
     fn list_transfer_configs(&self, project: &str, region: &str) -> Result<Vec<TransferConfig>> {
-        let configs: Vec<dts::TransferConfig> = self.block_on(async {
-            let client = self.transfer(project).await?;
-            Ok::<_, Error>(collect_items!(
-                client
-                    .list_transfer_configs()
-                    .set_parent(format!("projects/{project}/locations/{region}"))
-                    .set_data_source_ids(["scheduled_query"])
-                    .by_item()
-            ))
-        })?;
-        Ok(configs
-            .into_iter()
-            .filter(|tc| tc.data_source_id == "scheduled_query")
-            .map(|tc| TransferConfig {
-                query: tc
-                    .params
-                    .as_ref()
-                    .and_then(|p| p.get("query"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                update_time: tc
-                    .update_time
-                    .as_ref()
-                    .and_then(|t| DateTime::from_timestamp(t.seconds(), t.nanos() as u32)),
-                name: tc.name,
-                display_name: tc.display_name,
-                schedule: tc.schedule,
-                data_source_id: tc.data_source_id,
-            })
-            .collect())
+        self.block_on(self.scheduled_transfer_configs(project, region))
     }
 
     fn update_transfer_config_schedule(
@@ -870,6 +1024,7 @@ impl BqApi for GcpClient {
                 .await
                 .map_err(gax_error)
         })?;
+        self.update_cached_transfer_config(name, |tc| tc.schedule = schedule.to_owned());
         Ok(())
     }
 
@@ -911,6 +1066,7 @@ impl BqApi for GcpClient {
                 .await
                 .map_err(gax_error)
         })?;
+        self.update_cached_transfer_config(name, |tc| tc.query = sql.to_owned());
         Ok(())
     }
 
@@ -922,22 +1078,26 @@ impl BqApi for GcpClient {
         dest: &Path,
         fmt: DataFormat,
     ) -> Result<()> {
-        let (schema, rows) = self.block_on(async {
+        let result = self.block_on(async {
             let meta = self.get_table(project, dataset, table).await?;
-            match meta.r#type.as_str() {
-                // tabledata.list does not serve views: run them instead.
-                "VIEW" | "MATERIALIZED_VIEW" => {
-                    let sql = format!("SELECT * FROM `{project}.{dataset}.{table}`");
-                    let location = Some(meta.location.as_str()).filter(|l| !l.is_empty());
-                    self.run_sql(project, &sql, location).await
-                }
-                _ => {
-                    let rows = self.table_rows(project, dataset, table).await?;
-                    Ok((fields_of(meta.schema.as_ref()), rows))
-                }
+            if meta.r#type == "TABLE" {
+                let mut writer = TableWriter::create(fields_of(meta.schema.as_ref()), dest, fmt)?;
+                self.table_rows(project, dataset, table, |rows| writer.write_rows(rows))
+                    .await?;
+                return writer.finish();
             }
-        })?;
-        tabular::write_rows(&schema, &rows, dest, fmt)
+            // tabledata.list only serves native tables: run a query for
+            // views, external tables and the rest.
+            let sql = format!("SELECT * FROM `{project}.{dataset}.{table}`");
+            let location = Some(meta.location.as_str()).filter(|l| !l.is_empty());
+            let mut writer = None;
+            self.run_sql(project, &sql, location, |fields, rows| {
+                write_page(&mut writer, fields, &rows, dest, fmt)
+            })
+            .await?;
+            writer.map_or(Ok(()), TableWriter::finish)
+        });
+        discard_on_error(result, dest)
     }
 
     fn fetch_query_to_file(
@@ -947,8 +1107,15 @@ impl BqApi for GcpClient {
         dest: &Path,
         fmt: DataFormat,
     ) -> Result<()> {
-        let (schema, rows) = self.block_on(self.run_sql(project, sql, None))?;
-        tabular::write_rows(&schema, &rows, dest, fmt)
+        let result = self.block_on(async {
+            let mut writer = None;
+            self.run_sql(project, sql, None, |fields, rows| {
+                write_page(&mut writer, fields, &rows, dest, fmt)
+            })
+            .await?;
+            writer.map_or(Ok(()), TableWriter::finish)
+        });
+        discard_on_error(result, dest)
     }
 
     fn load_table_from_file(
@@ -965,7 +1132,6 @@ impl BqApi for GcpClient {
                 source.display()
             )));
         }
-        let data = std::fs::read(source).map_err(|e| Error::io(source, e))?;
         let mut load = json!({
             "destinationTable": {"projectId": project, "datasetId": dataset, "tableId": table},
             "sourceFormat": match fmt { DataFormat::Csv => "CSV", DataFormat::Parquet => "PARQUET" },
@@ -979,20 +1145,26 @@ impl BqApi for GcpClient {
             "configuration": {"load": load},
         });
         self.block_on(async {
-            let job = self.upload_load_job(project, &config, data).await?;
+            let deadline = tokio::time::Instant::now() + LOAD_JOB_TIMEOUT;
+            let job = self.upload_load_job(project, &config, source).await?;
             let reference = job.get("jobReference");
-            let field = |k: &str| {
-                reference
-                    .and_then(|r| r.get(k))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned()
-            };
-            let (job_id, location) = (field("jobId"), field("location"));
+            let field = |k: &str| reference.and_then(|r| r.get(k)).and_then(Value::as_str);
+            let job_id = field("jobId")
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| anyhow!("load job response without job id"))?;
+            let location = field("location").unwrap_or_default();
             loop {
-                let job = self.get_job(project, &job_id, &location).await?;
+                let job = self.get_job(project, job_id, location).await?;
                 if job.status.as_ref().is_some_and(|s| s.state == "DONE") {
                     return Ok::<_, Error>(());
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    self.cancel_job(project, job_id, location).await;
+                    return Err(anyhow!(
+                        "load job {job_id} still running after {} minutes; cancellation requested",
+                        LOAD_JOB_TIMEOUT.as_secs() / 60
+                    )
+                    .into());
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -1047,15 +1219,12 @@ impl BqApi for GcpClient {
         project: &str,
         dataset: &str,
         name: &str,
-        body: &str,
-        language: &str,
-        arguments: Option<&[RoutineArgument]>,
-        return_type: Option<&str>,
+        definition: &RoutineDefinition,
     ) -> Result<()> {
         self.block_on(async {
             match self
                 .update_routine(project, dataset, name, |r| {
-                    r.definition_body = body.to_owned()
+                    r.definition_body = definition.body.to_owned()
                 })
                 .await
             {
@@ -1065,16 +1234,8 @@ impl BqApi for GcpClient {
                 }
                 Err(e) if e.is_not_found() => {
                     log::info!("Routine {project}.{dataset}.{name} not found — creating.");
-                    self.create_routine(
-                        project,
-                        dataset,
-                        name,
-                        body,
-                        language,
-                        arguments,
-                        return_type,
-                    )
-                    .await
+                    self.create_routine(project, dataset, name, definition)
+                        .await
                 }
                 Err(e) => Err(e),
             }
@@ -1107,15 +1268,7 @@ impl BqApi for GcpClient {
     }
 
     fn upsert_saved_query(&self, project: &str, region: &str, name: &str, sql: &str) -> Result<()> {
-        self.block_on(async {
-            match self.update_saved_query(project, region, name, sql).await {
-                Err(Error::Invalid(_)) => {
-                    log::info!("Saved query '{name}' not found — creating.");
-                    self.create_saved_query(project, region, name, sql).await
-                }
-                other => other,
-            }
-        })
+        self.block_on(self.upsert_saved_query_inner(project, region, name, sql))
     }
 
     fn delete_view(&self, project: &str, dataset: &str, name: &str) -> Result<()> {
@@ -1166,12 +1319,13 @@ impl BqApi for GcpClient {
                 .await
                 .map_err(gax_error)
         })?;
+        self.repositories.lock().unwrap().clear();
         log::info!("Deleted saved query '{name}'");
         Ok(())
     }
 
     fn run_query(&self, project: &str, sql: &str, location: Option<&str>) -> Result<()> {
-        self.block_on(self.run_sql(project, sql, location))?;
+        self.block_on(self.run_sql(project, sql, location, |_, _| Ok(())))?;
         log::info!("Executed query on project '{project}'.");
         Ok(())
     }
@@ -1304,11 +1458,7 @@ fn schema_fields(schema: Option<&bq::TableSchema>) -> Vec<SchemaField> {
                 .map(|f| SchemaField {
                     name: f.name.clone(),
                     field_type: f.r#type.to_uppercase(),
-                    mode: if f.mode.is_empty() {
-                        "NULLABLE".to_owned()
-                    } else {
-                        f.mode.to_uppercase()
-                    },
+                    mode: normalize_mode(&f.mode),
                     description: f.description.clone().unwrap_or_default(),
                 })
                 .collect()
@@ -1321,17 +1471,69 @@ fn fields_of(schema: Option<&bq::TableSchema>) -> Vec<BqField> {
         BqField {
             name: f.name.clone(),
             field_type: f.r#type.to_uppercase(),
-            mode: if f.mode.is_empty() {
-                "NULLABLE".to_owned()
-            } else {
-                f.mode.to_uppercase()
-            },
+            mode: normalize_mode(&f.mode),
             fields: f.fields.iter().map(convert).collect(),
         }
     }
     schema
         .map(|s| s.fields.iter().map(convert).collect())
         .unwrap_or_default()
+}
+
+fn view_info(t: &bq::Table) -> ViewInfo {
+    ViewInfo {
+        name: table_id(t),
+        sql: t.view.as_ref().map(|v| v.query.clone()).unwrap_or_default(),
+        modified: from_millis(t.last_modified_time as i64).unwrap_or(EPOCH),
+        schema: schema_fields(t.schema.as_ref()),
+        description: t.description.clone().unwrap_or_default(),
+        created: from_millis(t.creation_time),
+        region: Some(t.location.clone()).filter(|l| !l.is_empty()),
+    }
+}
+
+fn external_table_info(t: &bq::Table) -> ExternalTableInfo {
+    let info = table_info(t);
+    let ext = t.external_data_configuration.as_ref();
+    ExternalTableInfo {
+        name: info.name,
+        source_uris: ext.map(|e| e.source_uris.clone()).unwrap_or_default(),
+        schema: info.schema,
+        source_format: ext.map(|e| e.source_format.clone()).unwrap_or_default(),
+        modified: info.modified,
+        description: info.description,
+        created: info.created,
+        region: info.region,
+        total_logical_bytes: info.total_logical_bytes,
+        row_count: info.row_count,
+        partitioning: info.partitioning,
+        clustering: info.clustering,
+        primary_keys: info.primary_keys,
+    }
+}
+
+/// Append *rows* to *writer*, creating it from *fields* on the first page.
+fn write_page(
+    writer: &mut Option<TableWriter>,
+    fields: &[BqField],
+    rows: &[Value],
+    dest: &Path,
+    fmt: DataFormat,
+) -> Result<()> {
+    let current = match writer.take() {
+        Some(w) => w,
+        None => TableWriter::create(fields.to_vec(), dest, fmt)?,
+    };
+    writer.insert(current).write_rows(rows)
+}
+
+/// Remove the partial file of *dest* when *result* is an error; an existing
+/// *dest* is left untouched.
+fn discard_on_error(result: Result<()>, dest: &Path) -> Result<()> {
+    if result.is_err() {
+        let _ = std::fs::remove_file(tabular::partial_path(dest));
+    }
+    result
 }
 
 fn table_info(t: &bq::Table) -> TableInfo {

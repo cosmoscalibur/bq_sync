@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::api::BqApi;
 use crate::error::{Error, Result};
 use crate::resources::{
-    DataFormat, ExternalTableInfo, RoutineArgument, RoutineInfo, SavedQueryInfo,
+    DataFormat, ExternalTableInfo, RoutineDefinition, RoutineInfo, SavedQueryInfo,
     ScheduledQueryInfo, TableInfo, TransferConfig, ViewInfo,
 };
 
@@ -130,12 +130,10 @@ impl BqApi for FakeApi {
         p: &str,
         d: &str,
         n: &str,
-        _body: &str,
-        language: &str,
-        arguments: Option<&[RoutineArgument]>,
-        return_type: Option<&str>,
+        definition: &RoutineDefinition,
     ) -> Result<()> {
-        let args = arguments.map_or("None".to_owned(), |a| {
+        let (language, return_type) = (definition.language, definition.return_type);
+        let args = definition.arguments.map_or("None".to_owned(), |a| {
             let items: Vec<String> = a
                 .iter()
                 .map(|a| format!("{}:{}", a.name, a.arg_type))

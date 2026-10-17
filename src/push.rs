@@ -14,7 +14,7 @@ use crate::api::BqApi;
 use crate::config::{SyncConfig, absolute_resolved, resolve_output_dir};
 use crate::error::{Error, Result};
 use crate::readers;
-use crate::resources::DataFormat;
+use crate::resources::{DataFormat, RoutineDefinition};
 use crate::utils::{confirm, stem};
 
 const VIEW_DIR: &str = "views";
@@ -81,28 +81,87 @@ pub struct Classified {
     pub name: String,
 }
 
-/// Classify *file* by its position under *output_root*.
-pub fn classify_path(file: &Path, output_root: &Path) -> Option<Classified> {
-    let file = absolute_resolved(file);
-    let root = absolute_resolved(output_root);
-    let rel = file.strip_prefix(&root).ok()?;
+/// A local file with its place in the output tree, classified once and
+/// reused by every later step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifiedFile {
+    /// Resolved absolute path.
+    pub path: PathBuf,
+    /// Path relative to the output root.
+    pub rel: PathBuf,
+    pub class: Classified,
+}
+
+impl ClassifiedFile {
+    /// Directory of the dataset holding the file; ``None`` for project-level
+    /// files.
+    fn dataset_dir(&self) -> Option<&Path> {
+        if self.class.dataset.is_empty() {
+            return None;
+        }
+        self.path.parent()?.parent()
+    }
+}
+
+/// Classify *path* by its position under *root*; ``Err(path)`` when it is
+/// not inside a recognised resource directory.
+fn classify_under(path: PathBuf, root: &Path) -> std::result::Result<ClassifiedFile, PathBuf> {
+    let Ok(rel) = path.strip_prefix(root).map(Path::to_path_buf) else {
+        return Err(path);
+    };
     let parts: Vec<String> = rel
         .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
-    match parts.as_slice() {
-        [dataset, rtype, filename] if KNOWN_DIRS.contains(&rtype.as_str()) => Some(Classified {
+    let class = match parts.as_slice() {
+        [dataset, rtype, filename] if KNOWN_DIRS.contains(&rtype.as_str()) => Classified {
             resource_type: rtype.clone(),
             dataset: dataset.clone(),
             name: stem(filename),
-        }),
-        [dir, filename] if PROJECT_DIRS.contains(&dir.as_str()) => Some(Classified {
+        },
+        [dir, filename] if PROJECT_DIRS.contains(&dir.as_str()) => Classified {
             resource_type: dir.clone(),
             dataset: String::new(),
             name: stem(filename),
-        }),
-        _ => None,
+        },
+        _ => return Err(path),
+    };
+    Ok(ClassifiedFile { path, rel, class })
+}
+
+/// Resolve and classify *files* under *output_root*.  Returns the
+/// classified files and the resolved paths outside any recognised resource
+/// directory.
+pub fn classify_files(
+    files: &[PathBuf],
+    output_root: &Path,
+) -> (Vec<ClassifiedFile>, Vec<PathBuf>) {
+    let root = absolute_resolved(output_root);
+    let (mut classified, mut unclassified) = (Vec::new(), Vec::new());
+    for file in files {
+        match classify_under(absolute_resolved(file), &root) {
+            Ok(item) => {
+                log::debug!("  classify {} -> {:?}", item.path.display(), item.class);
+                classified.push(item);
+            }
+            Err(path) => {
+                log::debug!("  classify {} -> None", path.display());
+                unclassified.push(path);
+            }
+        }
     }
+    (classified, unclassified)
+}
+
+/// Classify the files named on the command line, warning about those
+/// outside a recognised resource directory.
+fn classify_args(paths: &[String], output_root: &Path) -> Vec<ClassifiedFile> {
+    let files: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    let (classified, unclassified) = classify_files(&files, output_root);
+    for f in &unclassified {
+        log::warn!("Cannot classify, will skip: {}", f.display());
+    }
+    classified
 }
 
 fn suffix(file: &Path) -> &str {
@@ -111,18 +170,14 @@ fn suffix(file: &Path) -> &str {
         .unwrap_or_default()
 }
 
-/// Push a single local file to BigQuery.
+/// Push a single classified local file to BigQuery.
 pub fn push_file(
     api: &dyn BqApi,
-    file: &Path,
-    output_root: &Path,
+    item: &ClassifiedFile,
     project: &str,
     region: &str,
 ) -> Result<()> {
-    let Some(c) = classify_path(file, output_root) else {
-        log::warn!("Cannot classify file, skipping: {}", file.display());
-        return Ok(());
-    };
+    let (file, c) = (item.path.as_path(), &item.class);
     let ds = c.dataset.as_str();
     match (c.resource_type.as_str(), suffix(file)) {
         (VIEW_DIR, "sql") => {
@@ -142,24 +197,21 @@ pub fn push_file(
         (ROUTINE_DIR, "sql") => {
             let u = readers::read_routine_sql(file)?;
             // The create-fallback path needs the signature from the model YAML.
-            let model_yaml = output_root
-                .join(ds)
-                .join(MODEL_DIR)
-                .join(format!("{}.yaml", c.name));
-            let model = if model_yaml.is_file() {
-                Some(readers::read_routine_model_yaml(&model_yaml)?)
-            } else {
-                None
+            let model_yaml = item
+                .dataset_dir()
+                .map(|d| d.join(MODEL_DIR).join(format!("{}.yaml", c.name)))
+                .filter(|p| p.is_file());
+            let model = match model_yaml {
+                Some(p) => Some(readers::read_routine_model_yaml(&p)?),
+                None => None,
             };
-            api.upsert_routine(
-                project,
-                ds,
-                &u.name,
-                &u.body,
-                &u.language,
-                model.as_ref().map(|m| m.arguments.as_slice()),
-                model.as_ref().and_then(|m| m.return_type.as_deref()),
-            )
+            let definition = RoutineDefinition {
+                body: &u.body,
+                language: &u.language,
+                arguments: model.as_ref().map(|m| m.arguments.as_slice()),
+                return_type: model.as_ref().and_then(|m| m.return_type.as_deref()),
+            };
+            api.upsert_routine(project, ds, &u.name, &definition)
         }
         (ROUTINE_DIR, "yaml") => {
             let u = readers::read_model_yaml(file)?;
@@ -223,12 +275,9 @@ pub fn git_changed_files(output_root: &Path) -> Option<Vec<PathBuf>> {
         if line.is_empty() {
             continue;
         }
-        let p = absolute_resolved(&repo_root.join(line));
+        let p = repo_root.join(line);
         let is_file = p.is_file();
-        log::debug!(
-            "  path={line:?}  resolved={}  is_file={is_file}",
-            p.display()
-        );
+        log::debug!("  path={line:?}  joined={}  is_file={is_file}", p.display());
         if is_file && seen.insert(p.clone()) {
             files.push(p);
         }
@@ -253,7 +302,7 @@ pub fn mtime_changed_files(output_root: &Path, since_hours: f64) -> Vec<PathBuf>
             if meta.is_dir() {
                 stack.push(path);
             } else if meta.modified().is_ok_and(|m| m >= cutoff) {
-                files.push(absolute_resolved(&path));
+                files.push(path);
             }
         }
     }
@@ -261,48 +310,34 @@ pub fn mtime_changed_files(output_root: &Path, since_hours: f64) -> Vec<PathBuf>
     files
 }
 
-/// Keep only files inside a recognised resource directory.
-pub fn filter_pushable(files: &[PathBuf], output_root: &Path) -> Vec<PathBuf> {
-    files
-        .iter()
-        .filter(|f| {
-            let c = classify_path(f, output_root);
-            log::debug!("  classify {} -> {c:?}", f.display());
-            c.is_some()
-        })
-        .cloned()
-        .collect()
-}
-
-/// Whether *file* is a model YAML without a companion view / routine SQL
+/// Whether *item* is a model YAML without a companion view / routine SQL
 /// (i.e. a table or external table).
-pub fn is_materialized_model(file: &Path, output_root: &Path) -> bool {
-    let Some(c) = classify_path(file, output_root) else {
-        return false;
-    };
-    if c.resource_type != MODEL_DIR || suffix(file) != "yaml" || c.dataset.is_empty() {
+pub fn is_materialized_model(item: &ClassifiedFile) -> bool {
+    let c = &item.class;
+    if c.resource_type != MODEL_DIR || suffix(&item.path) != "yaml" {
         return false;
     }
-    let ds_dir = output_root.join(&c.dataset);
+    let Some(ds_dir) = item.dataset_dir() else {
+        return false;
+    };
     let sql = format!("{}.sql", c.name);
     !ds_dir.join(VIEW_DIR).join(&sql).is_file() && !ds_dir.join(ROUTINE_DIR).join(&sql).is_file()
 }
 
 /// Drop materialized model YAMLs unless *include_models*.
 pub fn filter_auto_pushable(
-    files: Vec<PathBuf>,
-    output_root: &Path,
+    files: Vec<ClassifiedFile>,
     include_models: bool,
-) -> Vec<PathBuf> {
+) -> Vec<ClassifiedFile> {
     if include_models {
         return files;
     }
     files
         .into_iter()
         .filter(|f| {
-            let skip = is_materialized_model(f, output_root);
+            let skip = is_materialized_model(f);
             if skip {
-                log::debug!("  skip materialized model {}", f.display());
+                log::debug!("  skip materialized model {}", f.path.display());
             }
             !skip
         })
@@ -318,38 +353,22 @@ fn push_order(path: &Path) -> u8 {
     }
 }
 
-fn sorted_for_push(files: &[PathBuf]) -> Vec<PathBuf> {
-    let mut sorted = files.to_vec();
-    sorted.sort_by_key(|p| push_order(p));
+fn sorted_for_push(files: &[ClassifiedFile]) -> Vec<&ClassifiedFile> {
+    let mut sorted: Vec<_> = files.iter().collect();
+    sorted.sort_by_key(|f| push_order(&f.path));
     sorted
 }
 
 /// Print a tagged changeset to stdout.
-pub fn display_changeset(
-    header: &str,
-    files: &[PathBuf],
-    output_root: &Path,
-    extra_items: &[String],
-) {
+pub fn display_changeset(header: &str, files: &[ClassifiedFile], extra_items: &[String]) {
     println!("\n  {header}:\n");
-    let root = absolute_resolved(output_root);
     for f in files {
-        let rel = f.strip_prefix(&root).unwrap_or(f);
-        let tag = classify_path(f, output_root)
-            .map(|c| c.resource_type)
-            .unwrap_or_else(|| "unknown".into());
-        println!("    [{tag}] {}", rel.display());
+        println!("    [{}] {}", f.class.resource_type, f.rel.display());
     }
     for item in extra_items {
         println!("    {item}");
     }
     println!();
-}
-
-fn warn_unclassified(files: &[PathBuf], kept: &[PathBuf]) {
-    for f in files.iter().filter(|f| !kept.contains(f)) {
-        log::warn!("Cannot classify, will skip: {}", f.display());
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -392,12 +411,7 @@ pub fn push_manual(
     opts: &PushOptions,
 ) -> Result<()> {
     let output_root = resolve_output_dir(config, config_path);
-    let files: Vec<PathBuf> = paths
-        .iter()
-        .map(|p| absolute_resolved(Path::new(p)))
-        .collect();
-    let pushable = filter_pushable(&files, &output_root);
-    warn_unclassified(&files, &pushable);
+    let pushable = classify_args(paths, &output_root);
 
     let extra: Vec<String> = data_spec
         .map(|d| {
@@ -416,22 +430,18 @@ pub fn push_manual(
         log::info!("Nothing to push.");
         return Ok(());
     }
-    display_changeset("Files to push", &pushable, &output_root, &extra);
+    display_changeset("Files to push", &pushable, &extra);
 
-    if opts.dry_run {
-        log::info!("Dry-run: no changes written.");
+    if !proceed(
+        opts,
+        "Dry-run: no changes written.",
+        "Proceed with push?",
+        "Push cancelled.",
+    ) {
         return Ok(());
     }
-    if !opts.yes && !confirm("Proceed with push?") {
-        log::info!("Push cancelled.");
-        return Ok(());
-    }
 
-    let project = &config.project.id;
-    let region = &config.project.default_region;
-    for f in sorted_for_push(&pushable) {
-        push_file(api, &f, &output_root, project, region)?;
-    }
+    push_all(api, config, &pushable)?;
     if let Some(d) = data_spec {
         api.load_table_from_file(&d.project, &d.dataset, &d.table, &d.source, d.fmt)?;
     }
@@ -471,8 +481,8 @@ pub fn push_auto(
             mtime_label(),
         )
     };
-    let files = filter_pushable(&candidates, &output_root);
-    let files = filter_auto_pushable(files, &output_root, opts.include_models);
+    let (files, _) = classify_files(&candidates, &output_root);
+    let files = filter_auto_pushable(files, opts.include_models);
 
     if files.is_empty() {
         log::info!("No changed files detected via {source_label}.");
@@ -484,25 +494,45 @@ pub fn push_auto(
     );
 
     if opts.dry_run {
-        display_changeset("Files that would be pushed", &files, &output_root, &[]);
-        log::info!("Dry-run: no changes written.");
+        display_changeset("Files that would be pushed", &files, &[]);
+    } else if !opts.yes {
+        display_changeset("Files to push", &files, &[]);
+    }
+    if !proceed(
+        opts,
+        "Dry-run: no changes written.",
+        "Proceed with push?",
+        "Push cancelled.",
+    ) {
         return Ok(());
     }
-    if !opts.yes {
-        display_changeset("Files to push", &files, &output_root, &[]);
-        if !confirm("Proceed with push?") {
-            log::info!("Push cancelled.");
-            return Ok(());
-        }
-    }
 
-    let project = &config.project.id;
-    let region = &config.project.default_region;
-    for f in sorted_for_push(&files) {
-        push_file(api, &f, &output_root, project, region)?;
-    }
+    push_all(api, config, &files)?;
     log::info!("Push complete.");
     log::info!("Hint: commit pushed changes with 'git commit'.");
+    Ok(())
+}
+
+/// Whether to carry out the changeset already shown: ``false`` for a dry
+/// run (reported with *dry_run_msg*) or when the user declines *prompt*
+/// (reported with *cancelled_msg*).
+fn proceed(opts: &PushOptions, dry_run_msg: &str, prompt: &str, cancelled_msg: &str) -> bool {
+    if opts.dry_run {
+        log::info!("{dry_run_msg}");
+        return false;
+    }
+    if !opts.yes && !confirm(prompt) {
+        log::info!("{cancelled_msg}");
+        return false;
+    }
+    true
+}
+
+/// Push *files* in dependency order (SQL before YAML).
+fn push_all(api: &dyn BqApi, config: &SyncConfig, files: &[ClassifiedFile]) -> Result<()> {
+    for f in sorted_for_push(files) {
+        push_file(api, f, &config.project.id, &config.project.default_region)?;
+    }
     Ok(())
 }
 
@@ -510,18 +540,9 @@ pub fn push_auto(
 // rm — delete the BQ resource, then the local file
 // ---------------------------------------------------------------------------
 
-/// Delete the BigQuery resource identified by *file*, then the file.
-pub fn rm_file(
-    api: &dyn BqApi,
-    file: &Path,
-    output_root: &Path,
-    project: &str,
-    region: &str,
-) -> Result<()> {
-    let Some(c) = classify_path(file, output_root) else {
-        log::warn!("Cannot classify file, skipping: {}", file.display());
-        return Ok(());
-    };
+/// Delete the BigQuery resource identified by *item*, then its file.
+pub fn rm_file(api: &dyn BqApi, item: &ClassifiedFile, project: &str, region: &str) -> Result<()> {
+    let (file, c) = (item.path.as_path(), &item.class);
     let ds = c.dataset.as_str();
     match (c.resource_type.as_str(), suffix(file)) {
         (VIEW_DIR, "sql") => api.delete_view(project, ds, &c.name)?,
@@ -563,40 +584,32 @@ pub fn rm_resources(
     opts: &PushOptions,
 ) -> Result<()> {
     let output_root = resolve_output_dir(config, config_path);
-    let files: Vec<PathBuf> = paths
-        .iter()
-        .map(|p| absolute_resolved(Path::new(p)))
-        .collect();
-    let removable = filter_pushable(&files, &output_root);
-    warn_unclassified(&files, &removable);
+    let (scheduled, removable): (Vec<_>, Vec<_>) = classify_args(paths, &output_root)
+        .into_iter()
+        .partition(|f| f.class.resource_type == SCHEDULED_QUERY_DIR);
+    for f in &scheduled {
+        log::warn!(
+            "rm does not delete scheduled queries, skipping: {}",
+            f.path.display()
+        );
+    }
 
     if removable.is_empty() {
         log::info!("Nothing to remove.");
         return Ok(());
     }
-    display_changeset(
-        "Resources to delete (BQ + local)",
-        &removable,
-        &output_root,
-        &[],
-    );
+    display_changeset("Resources to delete (BQ + local)", &removable, &[]);
 
-    if opts.dry_run {
-        log::info!("Dry-run: no resources deleted.");
-        return Ok(());
-    }
-    if !opts.yes && !confirm("Proceed with deletion?") {
-        log::info!("Deletion cancelled.");
+    if !proceed(
+        opts,
+        "Dry-run: no resources deleted.",
+        "Proceed with deletion?",
+        "Deletion cancelled.",
+    ) {
         return Ok(());
     }
     for f in &removable {
-        rm_file(
-            api,
-            f,
-            &output_root,
-            &config.project.id,
-            &config.project.default_region,
-        )?;
+        rm_file(api, f, &config.project.id, &config.project.default_region)?;
     }
     log::info!("Deletion complete.");
     log::info!("Hint: commit deletions with 'git add -A && git commit'.");
@@ -645,6 +658,13 @@ mod tests {
         })
     }
 
+    fn classify_path(file: &Path, root: &Path) -> Option<Classified> {
+        classify_files(&[file.to_path_buf()], root)
+            .0
+            .pop()
+            .map(|f| f.class)
+    }
+
     #[test]
     fn classify() {
         let dir = tempfile::tempdir().unwrap();
@@ -687,26 +707,29 @@ mod tests {
         let (_, root) = tree(dir.path());
         let view = write(&root.join("my_dataset/views/v.sql"), "SELECT 1");
         let unknown = write(&root.join("README.md"), "x");
-        assert_eq!(filter_pushable(&[view.clone(), unknown], &root), vec![view]);
+        let (kept, skipped) = classify_files(&[view.clone(), unknown.clone()], &root);
+        assert_eq!(kept.iter().map(|f| &f.path).collect::<Vec<_>>(), [&view]);
+        assert_eq!(skipped, vec![unknown]);
+        assert_eq!(kept[0].rel, Path::new("my_dataset/views/v.sql"));
 
         let table = write(&root.join("my_dataset/models/t.yaml"), "name: t");
         let v_model = write(&root.join("my_dataset/models/v.yaml"), "name: v");
         write(&root.join("my_dataset/routines/fn.sql"), "x");
         let fn_model = write(&root.join("my_dataset/models/fn.yaml"), "name: fn");
-        assert!(is_materialized_model(&table, &root));
-        assert!(!is_materialized_model(&v_model, &root));
-        assert!(!is_materialized_model(&fn_model, &root));
-        assert!(!is_materialized_model(
-            &root.join("my_dataset/views/v.sql"),
-            &root
-        ));
+        let classify_all = |paths: &[&PathBuf]| {
+            let paths: Vec<PathBuf> = paths.iter().map(|p| (*p).clone()).collect();
+            classify_files(&paths, &root).0
+        };
+        let models = classify_all(&[&table, &v_model, &fn_model, &view]);
+        let flags: Vec<bool> = models.iter().map(is_materialized_model).collect();
+        assert_eq!(flags, [true, false, false, false]);
 
-        let all = vec![table.clone(), v_model.clone()];
+        let all = classify_all(&[&table, &v_model]);
         assert_eq!(
-            filter_auto_pushable(all.clone(), &root, false),
-            vec![v_model]
+            filter_auto_pushable(all.clone(), false),
+            vec![all[1].clone()]
         );
-        assert_eq!(filter_auto_pushable(all.clone(), &root, true), all);
+        assert_eq!(filter_auto_pushable(all.clone(), true), all);
     }
 
     #[test]
@@ -878,6 +901,51 @@ mod tests {
                  CREATE OR REPLACE TABLE `p.d.t` AS SELECT 1\n"
             ]
         );
+    }
+
+    #[test]
+    fn duplicate_scheduled_query_names_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, root) = tree(dir.path());
+        let sq = write(
+            &root.join("scheduled_queries/daily_load.sql"),
+            "-- Scheduled Query: daily_load\n\nSELECT 1\n",
+        );
+        let api = FakeApi::default();
+        *api.transfer_configs.borrow_mut() = ["1", "2"]
+            .map(|id| crate::resources::TransferConfig {
+                name: format!("projects/p/locations/l/transferConfigs/{id}"),
+                display_name: "daily_load".into(),
+                data_source_id: "scheduled_query".into(),
+                ..Default::default()
+            })
+            .to_vec();
+        let opts = PushOptions {
+            yes: true,
+            ..Default::default()
+        };
+        let paths = [sq.to_string_lossy().into_owned()];
+        let err = push_manual(&api, &config(), &cfg, &paths, None, &opts).unwrap_err();
+        assert!(matches!(err, Error::Invalid(m) if m.contains("Several scheduled queries")));
+        assert!(api.calls().is_empty());
+    }
+
+    #[test]
+    fn rm_skips_scheduled_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, root) = tree(dir.path());
+        let sq = write(
+            &root.join("scheduled_queries/daily_load.sql"),
+            "-- Scheduled Query: daily_load\n\nSELECT 1\n",
+        );
+        let api = FakeApi::default();
+        let yes = PushOptions {
+            yes: true,
+            ..Default::default()
+        };
+        let paths = [sq.to_string_lossy().into_owned()];
+        rm_resources(&api, &config(), &cfg, &paths, &yes).unwrap();
+        assert!(api.calls().is_empty() && sq.exists());
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Pull orchestrator — fetch BigQuery resources to the local filesystem.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -8,6 +9,8 @@ use crate::api::BqApi;
 use crate::config::{SyncConfig, resolve_output_dir};
 use crate::error::{Error, Result};
 use crate::fetch::{FetchAction, has_uncommitted_changes, resolve};
+use crate::resources::DatasetResources;
+use crate::utils::file_stem_of;
 use crate::writers;
 
 /// Options shared by the pull functions.
@@ -55,81 +58,97 @@ impl PullOptions {
     }
 }
 
-/// Pull views, routines, tables and external tables of one dataset.
-pub fn pull_dataset(
-    api: &dyn BqApi,
-    config: &SyncConfig,
+/// Write the views, routines, tables and external tables of one dataset.
+fn write_dataset(
     output_root: &Path,
     dataset: &str,
+    resources: &DatasetResources,
     opts: &PullOptions,
 ) -> Result<()> {
-    let project = &config.project.id;
     let ds_dir = output_root.join(dataset);
     let models = |name: &str| ds_dir.join("models").join(format!("{name}.yaml"));
 
-    for view in api.list_views(project, dataset)? {
+    for view in &resources.views {
         let sql_path = ds_dir.join("views").join(format!("{}.sql", view.name));
         if opts.should_fetch("view", &view.name, view.modified, &sql_path) {
-            writers::write_view_sql(&sql_path, &view)?;
-            writers::write_view_model_yaml(&models(&view.name), &view)?;
+            writers::write_view_sql(&sql_path, view)?;
+            writers::write_view_model_yaml(&models(&view.name), view)?;
         }
     }
 
-    for routine in api.list_routines(project, dataset)? {
+    for routine in &resources.routines {
         let sql_path = ds_dir
             .join("routines")
             .join(format!("{}.sql", routine.name));
         if opts.should_fetch("routine", &routine.name, routine.modified, &sql_path) {
-            writers::write_routine_sql(&sql_path, &routine)?;
-            writers::write_routine_model_yaml(&models(&routine.name), &routine)?;
+            writers::write_routine_sql(&sql_path, routine)?;
+            writers::write_routine_model_yaml(&models(&routine.name), routine)?;
         }
     }
 
-    for table in api.list_tables(project, dataset)? {
+    for table in &resources.tables {
         let path = models(&table.name);
         if opts.should_fetch("model", &table.name, table.modified, &path) {
-            writers::write_model_yaml(&path, &table)?;
+            writers::write_model_yaml(&path, table)?;
         }
     }
 
-    for ext in api.list_external_tables(project, dataset)? {
+    for ext in &resources.externals {
         let path = models(&ext.name);
         if opts.should_fetch("external", &ext.name, ext.modified, &path) {
-            writers::write_external_definition(&path, &ext)?;
+            writers::write_external_definition(&path, ext)?;
         }
     }
     Ok(())
 }
 
-/// Pull project-level scheduled queries.
-pub fn pull_scheduled_queries(
-    api: &dyn BqApi,
-    config: &SyncConfig,
-    output_root: &Path,
-    opts: &PullOptions,
-) -> Result<()> {
-    let dir = output_root.join("scheduled_queries");
-    for sq in api.list_scheduled_queries(&config.project.id, &config.project.default_region)? {
-        let path = dir.join(format!("{}.sql", sq.name));
-        if opts.should_fetch("scheduled query", &sq.name, sq.modified, &path) {
-            writers::write_scheduled_query_sql(&path, &sq)?;
-        }
+/// File for the project-level query *name* in *dir*.  ``None`` when an
+/// earlier query of the same pull already maps to that file name, so the
+/// first one is not overwritten.
+fn query_path(
+    dir: &Path,
+    name: &str,
+    kind: &str,
+    claimed: &mut HashSet<PathBuf>,
+) -> Option<PathBuf> {
+    if name.contains(['\n', '\r']) {
+        log::warn!(
+            "Skipping {kind} '{}': a name with a line break cannot be stored in its file header.",
+            name.escape_debug()
+        );
+        return None;
     }
-    Ok(())
+    let path = dir.join(format!("{}.sql", file_stem_of(name)));
+    // Case-insensitive filesystems map names differing only in case to one file.
+    if claimed.insert(PathBuf::from(path.to_string_lossy().to_lowercase())) {
+        Some(path)
+    } else {
+        log::warn!(
+            "Skipping {kind} '{name}': {} already holds another {kind}.",
+            path.display()
+        );
+        None
+    }
 }
 
-/// Pull project-level saved queries (Dataform).
-pub fn pull_saved_queries(
-    api: &dyn BqApi,
-    config: &SyncConfig,
-    output_root: &Path,
+/// Write the project-level *queries* of one *kind* into *dir*; *describe*
+/// gives a query's name and modification time, *write* writes its file.
+fn write_queries<T>(
+    dir: &Path,
+    kind: &str,
+    queries: &[T],
     opts: &PullOptions,
+    describe: impl Fn(&T) -> (&str, DateTime<Utc>),
+    write: impl Fn(&Path, &T) -> Result<()>,
 ) -> Result<()> {
-    let dir = output_root.join("saved_queries");
-    for saved in api.list_saved_queries(&config.project.id, &config.project.default_region)? {
-        let path = dir.join(format!("{}.sql", saved.name));
-        if opts.should_fetch("saved query", &saved.name, saved.modified, &path) {
-            writers::write_saved_query_sql(&path, &saved)?;
+    let mut claimed = HashSet::new();
+    for query in queries {
+        let (name, modified) = describe(query);
+        let Some(path) = query_path(dir, name, kind, &mut claimed) else {
+            continue;
+        };
+        if opts.should_fetch(kind, name, modified, &path) {
+            write(&path, query)?;
         }
     }
     Ok(())
@@ -160,12 +179,31 @@ pub fn pull_project(
         config.project.id,
         output_root.display()
     );
-    for dataset in &config.datasets {
+    let listing = api.list_pull_resources(
+        &config.project.id,
+        &config.project.default_region,
+        &config.datasets,
+    )?;
+    for (dataset, resources) in config.datasets.iter().zip(&listing.datasets) {
         log::info!("Processing dataset '{dataset}'");
-        pull_dataset(api, config, &output_root, dataset, opts)?;
+        write_dataset(&output_root, dataset, resources, opts)?;
     }
-    pull_scheduled_queries(api, config, &output_root, opts)?;
-    pull_saved_queries(api, config, &output_root, opts)?;
+    write_queries(
+        &output_root.join("scheduled_queries"),
+        "scheduled query",
+        &listing.scheduled,
+        opts,
+        |q| (q.name.as_str(), q.modified),
+        writers::write_scheduled_query_sql,
+    )?;
+    write_queries(
+        &output_root.join("saved_queries"),
+        "saved query",
+        &listing.saved,
+        opts,
+        |q| (q.name.as_str(), q.modified),
+        writers::write_saved_query_sql,
+    )?;
 
     log::info!("Pull complete.");
     log::info!("Hint: review changes with 'git diff' and commit with 'git add -A && git commit'.");
@@ -252,6 +290,33 @@ mod tests {
         ] {
             assert!(root.join(rel).is_file(), "missing {rel}");
         }
+    }
+
+    #[test]
+    fn project_query_names_stay_inside_their_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("bq_sync.toml");
+        let api = fake();
+        let ts = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let scheduled = |name: &str| ScheduledQueryInfo {
+            name: name.into(),
+            sql: "SELECT 1".into(),
+            schedule: "every 24 hours".into(),
+            modified: ts,
+        };
+        *api.scheduled.borrow_mut() = vec![
+            scheduled("../../escape"),
+            scheduled("a/b"),
+            scheduled("a_b"),
+        ];
+        let root = pull_project(&api, &config(), &cfg_path, &PullOptions::default()).unwrap();
+        let written: Vec<_> = std::fs::read_dir(root.join("scheduled_queries"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(written.len(), 2, "{written:?}");
+        assert!(written.contains(&".._.._escape.sql".to_owned()));
+        assert!(!dir.path().join("escape.sql").exists());
     }
 
     #[test]
