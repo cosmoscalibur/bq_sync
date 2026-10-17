@@ -16,7 +16,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
   unchanged; the Python package exposes the same operations through the
   `bq_sync._bq_sync` PyO3 extension and requires CPython 3.12 or newer.
 - `fetch` writes rows page by page and `push --data` streams the source
-  file, so table size is not bounded by memory.
+  file instead of loading either in memory.
 - A scheduled query display name shared by several scheduled queries is an
   error in `push` and `reschedule` instead of matching the first one.
 - `rm` skips scheduled query files.
