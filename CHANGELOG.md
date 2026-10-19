@@ -8,7 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
 ### Added
 
 - `push` updates the query SQL of existing scheduled queries from
-  `scheduled_queries/*.sql`, keeping their other settings.
+  `scheduled_queries/*.sql`, keeping their other settings. `rm` skips
+  scheduled query files.
 
 ### Changed
 
@@ -18,8 +19,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
 - `fetch` writes rows page by page and `push --data` streams the source
   file instead of loading either in memory.
 - A scheduled query display name shared by several scheduled queries is an
-  error in `push` and `reschedule` instead of matching the first one.
-- `rm` skips scheduled query files.
+  error in `push` and `reschedule`; `reschedule` previously used the first
+  match.
 - `pull` replaces path separators in scheduled and saved query file names
   and skips names that collide or contain a line break.
 - Listing saved queries returns an empty list only when Dataform is not
