@@ -7,11 +7,46 @@ Sync BigQuery resources to a local directory structure.
 `bq-sync` is written in Rust and ships both as a native binary and as a
 Python package (PyO3 extension, one abi3 wheel for CPython ≥ 3.12).
 
+### From a GitHub release
+
+Each release (`vX.Y.Z`) attaches the CLI binaries
+(`bq-sync-vX.Y.Z-<target>.tar.gz` / `.zip` for Linux x86_64 and arm64,
+macOS arm64 and Windows x86_64), Python wheels (abi3, CPython ≥ 3.12) for the
+same platforms, an sdist and `SHA256SUMS`.
+
+Install the CLI as a uv tool. `--find-links` points uv at the release's
+asset list and it picks the wheel matching your platform:
+
+```zsh
+uv tool install bq-sync \
+  --find-links https://github.com/cosmoscalibur/bq_sync/releases/expanded_assets/v0.3.0
+```
+
+Use it as a library in a project (`import bq_sync`):
+
+```zsh
+uv add bq-sync \
+  --find-links https://github.com/cosmoscalibur/bq_sync/releases/expanded_assets/v0.3.0
+```
+
+or install a specific wheel by URL (copy it from the release page):
+
+```zsh
+uv tool install https://github.com/cosmoscalibur/bq_sync/releases/download/v0.3.0/<wheel-file>.whl
+```
+
+To upgrade, rerun the command with the new tag.
+The wheel-based install needs no Rust toolchain. To use the standalone
+binary instead, download the archive for your platform from the release,
+verify it against `SHA256SUMS`, extract it and put `bq-sync` on your `PATH`.
+
+### From source
+
 ```zsh
 # Python package (provides the `bq-sync` command and `import bq_sync`)
-pip install .
+uv tool install .
 # or
-uv pip install .
+pip install .
 
 # Native binary only
 cargo install --path .

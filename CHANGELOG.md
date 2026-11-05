@@ -5,8 +5,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-05
+
 ### Added
 
+- Release workflow: pushing a `vX.Y.Z` tag builds CLI binaries and PyO3
+  wheels (Linux x86_64/arm64, macOS arm64, Windows x86_64) plus an sdist and
+  checksums, and publishes them as a GitHub release.
 - `push` updates the query SQL of existing scheduled queries from
   `scheduled_queries/*.sql`, keeping their other settings. `rm` skips
   scheduled query files.
