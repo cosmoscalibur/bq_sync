@@ -895,7 +895,7 @@ impl GcpClient {
         client
             .commit_workspace_changes()
             .set_name(workspace)
-            .set_author(df::CommitAuthor::new().set_name("bq-sync"))
+            .set_author(commit_author())
             .set_commit_message("Saved")
             .send()
             .await
@@ -1538,6 +1538,57 @@ fn http_error(status: u16, body: &[u8]) -> Error {
 }
 
 /// Dataform repository IDs must be URL-safe (lowercase, hyphens).
+const TOOL_NAME: &str = "bq-sync";
+
+/// Output of ``program args``, trimmed; ``None`` on failure or empty output.
+fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!text.is_empty()).then_some(text)
+}
+
+/// Commit author as ``(name, email)``: the git identity when configured,
+/// else the active gcloud account, with the tool appended to the name
+/// (``Jane Doe (bq-sync)``) so commits stay attributable to the user.
+fn author_identity(
+    git_name: Option<String>,
+    git_email: Option<String>,
+    gcloud_account: impl FnOnce() -> Option<String>,
+) -> (String, String) {
+    let (name, email) = match (git_name, git_email) {
+        (Some(n), e) => (n, e.unwrap_or_default()),
+        (None, e) => match e.or_else(gcloud_account) {
+            Some(account) => (account.clone(), account),
+            None => (String::new(), String::new()),
+        },
+    };
+    let name = if name.is_empty() {
+        TOOL_NAME.to_owned()
+    } else {
+        format!("{name} ({TOOL_NAME})")
+    };
+    (name, email)
+}
+
+fn commit_author() -> df::CommitAuthor {
+    static IDENTITY: LazyLock<(String, String)> = LazyLock::new(|| {
+        author_identity(
+            command_output("git", &["config", "user.name"]),
+            command_output("git", &["config", "user.email"]),
+            || command_output("gcloud", &["config", "get-value", "account", "--quiet"]),
+        )
+    });
+    df::CommitAuthor::new()
+        .set_name(IDENTITY.0.clone())
+        .set_email_address(IDENTITY.1.clone())
+}
+
 /// Longest wait for a manual scheduled query run to finish.
 const TRANSFER_RUN_TIMEOUT: Duration = Duration::from_secs(3600);
 
@@ -1736,6 +1787,25 @@ fn sql_type(name: &str) -> bq::StandardSqlDataType {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn author_identity_prefers_git_then_gcloud() {
+        use super::author_identity as id;
+        let some = |s: &str| Some(s.to_owned());
+        assert_eq!(
+            id(some("Edward Villegas"), some("e@x.co"), || some("g@x.co")),
+            ("Edward Villegas (bq-sync)".into(), "e@x.co".into())
+        );
+        assert_eq!(
+            id(None, None, || some("g@x.co")),
+            ("g@x.co (bq-sync)".into(), "g@x.co".into())
+        );
+        assert_eq!(
+            id(None, some("e@x.co"), || None),
+            ("e@x.co (bq-sync)".into(), "e@x.co".into())
+        );
+        assert_eq!(id(None, None, || None), ("bq-sync".into(), String::new()));
+    }
+
     use super::*;
 
     #[test]

@@ -27,7 +27,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
 - `push` commits and pushes the Dataform workspace when creating or
   updating a saved query, so Studio no longer fails with "no commits found".
   Changes left uncommitted by earlier versions are committed on the next
-  push of that file.
+  push of that file. The commit author is the git user (or the active gcloud
+  account) followed by `(bq-sync)`, e.g. `Edward Villegas (bq-sync)`.
 
 ## [0.3.0] - 2026-11-05
 

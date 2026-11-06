@@ -253,7 +253,9 @@ Saved queries are read and written through the Dataform API as the
 name matches the saved query. A saved query created by `push` gets the label
 `single-file-asset-type: sql` (what BigQuery Studio uses to list it), and every
 `push` of a saved query commits and pushes the workspace with the message
-`Saved`, so Studio finds its history. Saved queries left uncommitted by
+`Saved`, so Studio finds its history. The commit author is the git identity
+(`git config user.name` / `user.email`), or the active gcloud account when git
+has none, with the tool appended: `Edward Villegas (bq-sync)`. Saved queries left uncommitted by
 earlier versions are committed the next time they are pushed by path
 (`bq-sync push saved_queries/<name>.sql`), even if their content did not
 change.
