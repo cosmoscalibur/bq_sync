@@ -4,21 +4,23 @@ Sync BigQuery resources to a local directory structure.
 
 ## Install
 
-`bq-sync` is written in Rust and distributed as a Python tool (PyO3
-extension, one abi3 wheel for CPython ≥ 3.12). There are no standalone
-binaries.
+`bq-sync` is written in Rust and ships both as a native binary and as a
+Python package (PyO3 extension, one abi3 wheel for CPython ≥ 3.12).
 
 ### From a GitHub release
 
-Each release (`vX.Y.Z`) attaches Python wheels (abi3, CPython ≥ 3.12) for
-Linux x86_64/arm64, macOS arm64 and Windows x86_64, an sdist and
-`SHA256SUMS`. `--find-links` points uv at the release's asset list and it
-picks the wheel matching your platform; no Rust toolchain is needed.
+Each release (`vX.Y.Z`) attaches the CLI binaries
+(`bq-sync-vX.Y.Z-<target>.tar.gz` / `.zip` for Linux x86_64 and arm64,
+macOS arm64 and Windows x86_64), Python wheels (abi3, CPython ≥ 3.12) for the
+same platforms, an sdist and `SHA256SUMS`.
+
+`--find-links` points uv at the release's asset list and it picks the wheel
+matching your platform; no Rust toolchain is needed.
 
 Run it without installing (`uvx`):
 
 ```zsh
-uvx --find-links https://github.com/cosmoscalibur/bq_sync/releases/expanded_assets/v0.3.0 \
+uvx --find-links https://github.com/cosmoscalibur/bq_sync/releases/expanded_assets/v0.3.1 \
   bq-sync --help
 ```
 
@@ -26,30 +28,37 @@ Install it as a uv tool:
 
 ```zsh
 uv tool install bq-sync \
-  --find-links https://github.com/cosmoscalibur/bq_sync/releases/expanded_assets/v0.3.0
+  --find-links https://github.com/cosmoscalibur/bq_sync/releases/expanded_assets/v0.3.1
 ```
 
 Use it as a library in a project (`import bq_sync`):
 
 ```zsh
 uv add bq-sync \
-  --find-links https://github.com/cosmoscalibur/bq_sync/releases/expanded_assets/v0.3.0
+  --find-links https://github.com/cosmoscalibur/bq_sync/releases/expanded_assets/v0.3.1
 ```
 
 or install a specific wheel by URL (copy it from the release page):
 
 ```zsh
-uv tool install https://github.com/cosmoscalibur/bq_sync/releases/download/v0.3.0/<wheel-file>.whl
+uv tool install https://github.com/cosmoscalibur/bq_sync/releases/download/v0.3.1/<wheel-file>.whl
 ```
 
 To upgrade, rerun the command with the new tag.
+To use the standalone binary instead, download the archive for your platform
+from the release, verify it against `SHA256SUMS`, extract it and put `bq-sync`
+on your `PATH`.
 
 ### From source
 
 ```zsh
+# Python package (provides the `bq-sync` command and `import bq_sync`)
 uv tool install .
 # or
 pip install .
+
+# Native binary only
+cargo install --path .
 ```
 
 Building from source requires Rust 1.99 (pinned in `rust-toolchain.toml`)
@@ -169,13 +178,16 @@ that name.
 
 ### materialize
 
-Creates `<dataset>.<target>` from the view or external table (default target:
-`view_x` / `external_x` become `materialize_x`) and refreshes the model YAML.
-If a scheduled query already creates the target (a `CREATE [OR REPLACE] TABLE`
-on it), `materialize` runs that scheduled query and waits for it instead of
-the generic `CREATE OR REPLACE TABLE … AS SELECT *`, so customizations such as
-`CLUSTER BY` or partitioning are kept. Several matching scheduled queries are
-an error.
+Creates `<dataset>.<target>` from a view or external table and refreshes the
+model YAML. The resource can be given by either name of the pair: `view_x` /
+`external_x` (target `materialize_x`) or `materialize_x` itself (the source is
+the existing `view_x` or `external_x`).
+
+If a scheduled query named after the target exists (the `-- Scheduled Query:`
+header of its file, e.g. `materialize_x`), `materialize` runs that scheduled
+query and waits for it instead of the generic
+`CREATE OR REPLACE TABLE … AS SELECT *`, so customizations such as `CLUSTER BY`
+or partitioning are kept. Without it, the generic DDL runs.
 
 ### rm options
 
@@ -275,7 +287,7 @@ maturin develop --uv            # build the extension into the venv
 pytest                          # Python binding tests
 ```
 
-Layout: `src/` (Rust crate: library, PyO3 module in
+Layout: `src/` (Rust crate: library, `bq-sync` binary, PyO3 module in
 `src/python.rs` behind the `python` feature), `python/bq_sync/` (Python
 package shim and stubs), `tests/` (Python binding tests).
 

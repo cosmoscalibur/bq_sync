@@ -5,24 +5,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-06
+
 ### Added
 
 - `rm` deletes scheduled queries (Data Transfer transfer configs) resolved
   by their `-- Scheduled Query:` header name, then removes the local file.
   If the scheduled query no longer exists remotely, only the local file is
   removed.
-- `materialize` runs the scheduled query that already creates the target
-  table (a `CREATE [OR REPLACE] TABLE` on it) instead of the generic
+- `materialize` accepts either name of the view/materialize pair
+  (`view_x` / `external_x` or `materialize_x`). If a scheduled query named
+  after the target exists, it is run (and awaited) instead of the generic
   `SELECT *` DDL, preserving its customization (`CLUSTER BY`, partitioning,
-  options). It waits for the run to finish and then refreshes the model
-  YAML. Without such a scheduled query the behavior is unchanged; several
-  matches are an error.
-
-### Changed
-
-- Standalone CLI binaries are no longer built or released; bq-sync is
-  distributed as Python wheels and an sdist and runs with `uvx` or
-  `uv tool install`. The `bq-sync` Cargo binary target is removed.
+  options); then the model YAML is refreshed. Without it the behavior is
+  unchanged.
 
 ### Fixed
 

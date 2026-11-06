@@ -274,32 +274,3 @@ mod tests {
         assert!(!confirm_from("ok?", &mut eof));
     }
 }
-
-/// Pattern for a ``CREATE [OR REPLACE] TABLE`` statement on
-/// ``project.dataset.table``, with or without backticks and with the
-/// qualified name optionally quoted as a whole or per part.
-pub fn create_table_regex(project: &str, dataset: &str, table: &str) -> regex::Regex {
-    let part = |s: &str| regex::escape(s);
-    let pattern = format!(
-        r"(?is)\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?`?{p}`?\.`?{d}`?\.`?{t}`?(?:[\s(;]|$)",
-        p = part(project),
-        d = part(dataset),
-        t = part(table)
-    );
-    regex::Regex::new(&pattern).expect("valid pattern")
-}
-
-#[cfg(test)]
-mod create_table_regex_tests {
-    use super::create_table_regex;
-
-    #[test]
-    fn matches_target_only() {
-        let re = create_table_regex("p", "d", "t");
-        assert!(re.is_match("create or replace table `p.d.t`\nCLUSTER BY a AS SELECT 1"));
-        assert!(re.is_match("CREATE TABLE p.d.t (a INT64)"));
-        assert!(re.is_match("CREATE OR REPLACE TABLE `p`.`d`.`t` AS SELECT 1"));
-        assert!(!re.is_match("CREATE OR REPLACE TABLE `p.d.t2` AS SELECT 1"));
-        assert!(!re.is_match("INSERT INTO `p.d.t` SELECT 1"));
-    }
-}
