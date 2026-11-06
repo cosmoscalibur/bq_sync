@@ -20,7 +20,7 @@ matching your platform; no Rust toolchain is needed.
 Run it without installing (`uvx`):
 
 ```zsh
-uvx --find-links https://github.com/cosmoscalibur/bq_sync/releases/expanded_assets/v0.3.1 \
+uvx --find-links https://github.com/cosmoscalibur/bq_sync/releases/expanded_assets/v0.3.2 \
   bq-sync --help
 ```
 
@@ -28,20 +28,20 @@ Install it as a uv tool:
 
 ```zsh
 uv tool install bq-sync \
-  --find-links https://github.com/cosmoscalibur/bq_sync/releases/expanded_assets/v0.3.1
+  --find-links https://github.com/cosmoscalibur/bq_sync/releases/expanded_assets/v0.3.2
 ```
 
 Use it as a library in a project (`import bq_sync`):
 
 ```zsh
 uv add bq-sync \
-  --find-links https://github.com/cosmoscalibur/bq_sync/releases/expanded_assets/v0.3.1
+  --find-links https://github.com/cosmoscalibur/bq_sync/releases/expanded_assets/v0.3.2
 ```
 
 or install a specific wheel by URL (copy it from the release page):
 
 ```zsh
-uv tool install https://github.com/cosmoscalibur/bq_sync/releases/download/v0.3.1/<wheel-file>.whl
+uv tool install https://github.com/cosmoscalibur/bq_sync/releases/download/v0.3.2/<wheel-file>.whl
 ```
 
 To upgrade, rerun the command with the new tag.
