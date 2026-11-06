@@ -223,7 +223,7 @@ pub fn push_file(
         }
         (SCHEDULED_QUERY_DIR, "sql") => {
             let u = readers::read_scheduled_query_sql(file)?;
-            api.upsert_scheduled_query_sql(project, region, &u.name, &u.sql)
+            api.upsert_scheduled_query_sql(project, region, &u.name, &u.sql, u.schedule.as_deref())
         }
         _ => {
             log::warn!(
@@ -870,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_query_push_updates_sql_only() {
+    fn scheduled_query_push_updates_existing_and_creates_missing() {
         let dir = tempfile::tempdir().unwrap();
         let (cfg, root) = tree(dir.path());
         let sq = write(
@@ -894,15 +894,37 @@ mod tests {
         };
         let paths = [&sq, &missing].map(|p| p.to_string_lossy().into_owned());
         push_manual(&api, &config(), &cfg, &paths, None, &opts).unwrap();
-        // Only the existing query is updated; the missing one is skipped
-        // (no create path) and the schedule header is not pushed.
+        // The existing query gets its SQL and (changed) schedule updated;
+        // the missing one is created from its headers.
         assert_eq!(
             api.calls(),
             vec![
                 "update_query projects/my-project/locations/us-east1/transferConfigs/7 \
-                 CREATE OR REPLACE TABLE `p.d.t` AS SELECT 1\n"
+                 CREATE OR REPLACE TABLE `p.d.t` AS SELECT 1\n",
+                "update_schedule projects/my-project/locations/us-east1/transferConfigs/7 \
+                 every 24 hours",
+                "create_transfer gone | every 24 hours | SELECT 1\n"
             ]
         );
+    }
+
+    #[test]
+    fn missing_scheduled_query_without_schedule_header_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, root) = tree(dir.path());
+        let sq = write(
+            &root.join("scheduled_queries/new_one.sql"),
+            "-- Scheduled Query: new_one\n\nSELECT 1\n",
+        );
+        let api = FakeApi::default();
+        let opts = PushOptions {
+            yes: true,
+            ..Default::default()
+        };
+        let paths = [sq.to_string_lossy().into_owned()];
+        let err = push_manual(&api, &config(), &cfg, &paths, None, &opts).unwrap_err();
+        assert!(matches!(err, Error::Invalid(m) if m.contains("-- Schedule:")));
+        assert!(api.calls().is_empty());
     }
 
     #[test]

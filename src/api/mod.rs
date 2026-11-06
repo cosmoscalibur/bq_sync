@@ -55,6 +55,17 @@ pub trait BqApi {
     /// until it finishes; a failed or cancelled run is an error.
     fn run_transfer_config_and_wait(&self, project: &str, name: &str) -> Result<()>;
 
+    /// Create a scheduled-query transfer config with no destination
+    /// dataset (valid for DDL/DML scripts).
+    fn create_transfer_config(
+        &self,
+        project: &str,
+        region: &str,
+        display_name: &str,
+        schedule: &str,
+        sql: &str,
+    ) -> Result<()>;
+
     /// Delete a transfer config by resource name.
     fn delete_transfer_config(&self, project: &str, name: &str) -> Result<()>;
 
@@ -109,27 +120,39 @@ pub trait BqApi {
         Ok(())
     }
 
-    /// Update the SQL of the scheduled query named *display_name*.
+    /// Update the SQL of the scheduled query named *display_name*, or create
+    /// it from *schedule* and *sql* when it does not exist.
     ///
-    /// There is no create path: a scheduled query also needs a schedule,
-    /// destination and other settings the SQL file does not carry, so a
-    /// missing query is reported and skipped.
+    /// An existing query gets its SQL and, when the file has a different
+    /// `-- Schedule:` header, its schedule updated (like `reschedule
+    /// --from-file`). A created query has no destination dataset,
+    /// so it must be a DDL/DML script; a missing `-- Schedule:` header is an
+    /// error.
     fn upsert_scheduled_query_sql(
         &self,
         project: &str,
         region: &str,
         display_name: &str,
         sql: &str,
+        schedule: Option<&str>,
     ) -> Result<()> {
         let Some(tc) = self.get_transfer_config(project, region, display_name)? else {
-            log::warn!(
-                "Scheduled query '{display_name}' not found in {project}/{region}; \
-                 skipping SQL push. Create the scheduled query in the BQ console first."
-            );
+            let schedule = schedule.ok_or_else(|| {
+                crate::Error::Invalid(format!(
+                    "Scheduled query '{display_name}' does not exist in {project}/{region} \
+                     and its file has no '-- Schedule: <schedule>' header, needed to create it."
+                ))
+            })?;
+            self.create_transfer_config(project, region, display_name, schedule, sql)?;
+            log::info!("Created scheduled query '{display_name}' ({schedule}).");
             return Ok(());
         };
         self.update_transfer_config_query(project, &tc.name, sql)?;
         log::info!("Updated SQL for scheduled query '{display_name}'.");
+        if let Some(schedule) = schedule.filter(|s| *s != tc.schedule) {
+            self.update_transfer_config_schedule(project, &tc.name, schedule)?;
+            log::info!("Updated schedule for '{display_name}' to '{schedule}'.");
+        }
         Ok(())
     }
 

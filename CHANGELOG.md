@@ -5,6 +5,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- `push` creates a scheduled query that does not exist in BigQuery from the
+  `-- Scheduled Query:` / `-- Schedule:` headers and the SQL body (no
+  destination dataset, so DDL/DML scripts). Previously it was skipped with
+  a warning.
+- `push` of an existing scheduled query also updates its schedule when the
+  `-- Schedule:` header differs (previously only the SQL was pushed).
+
 ### Fixed
 
 - `check` no longer aborts with a `PanicException` on tables with

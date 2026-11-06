@@ -157,12 +157,15 @@ corresponding SQL file).  Use `--include-models` to include them.
 Pushable resources: views (SQL), routines (SQL/JS), models (YAML descriptions),
 saved queries (SQL) and scheduled queries (SQL).
 
-Scheduled queries are update-only: `push` replaces the query SQL of an
-existing scheduled query (matched by its `-- Scheduled Query:` header) and
-keeps its other settings. The `-- Schedule:` header is not pushed — use
-`bq-sync reschedule --from-file` for schedule changes. A scheduled query
-that does not exist in BigQuery is skipped with a warning; create it in the
-console first. Scheduled query display names are not unique in BigQuery: a name
+`push` makes BigQuery match the file, whether the scheduled query is new or
+not (matched by its `-- Scheduled Query:` header). An existing query gets its
+SQL replaced and, if the `-- Schedule:` header differs, its schedule updated;
+other settings are kept. (`bq-sync reschedule` remains for schedule-only
+changes.) A query that does not exist in BigQuery is created from the
+`-- Scheduled Query:` and `-- Schedule:` headers and the SQL body (a missing
+`-- Schedule:` header is an error). A created query has no destination dataset, so its SQL must be
+a DDL/DML script (e.g. `CREATE OR REPLACE TABLE ...`); other settings
+(service account, notifications, destination table) are not set. Scheduled query display names are not unique in BigQuery: a name
 shared by several scheduled queries makes `push` and `reschedule` fail for
 that name.
 

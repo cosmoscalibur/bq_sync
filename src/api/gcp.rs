@@ -1159,6 +1159,39 @@ impl BqApi for GcpClient {
         })
     }
 
+    fn create_transfer_config(
+        &self,
+        project: &str,
+        region: &str,
+        display_name: &str,
+        schedule: &str,
+        sql: &str,
+    ) -> Result<()> {
+        let mut params = serde_json::Map::new();
+        params.insert("query".to_owned(), Value::String(sql.to_owned()));
+        self.block_on(async {
+            self.transfer(project)
+                .await?
+                .create_transfer_config()
+                .set_parent(format!("projects/{project}/locations/{region}"))
+                .set_transfer_config(
+                    dts::TransferConfig::new()
+                        .set_display_name(display_name)
+                        .set_data_source_id("scheduled_query")
+                        .set_schedule(schedule)
+                        .set_params(params),
+                )
+                .send()
+                .await
+                .map_err(gax_error)
+        })?;
+        self.transfer_configs
+            .lock()
+            .unwrap()
+            .remove(&(project.to_owned(), region.to_owned()));
+        Ok(())
+    }
+
     fn delete_transfer_config(&self, project: &str, name: &str) -> Result<()> {
         self.block_on(async {
             self.transfer(project)
