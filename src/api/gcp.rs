@@ -876,6 +876,28 @@ impl GcpClient {
         Ok(saved.into_iter().flatten().collect())
     }
 
+    /// Commit and push the workspace so the content is part of the
+    /// repository history; BigQuery Studio cannot load a saved query whose
+    /// content is only an uncommitted workspace change.
+    async fn commit_saved_query(&self, project: &str, workspace: &str) -> Result<()> {
+        let client = self.dataform(project).await?;
+        client
+            .commit_workspace_changes()
+            .set_name(workspace)
+            .set_author(df::CommitAuthor::new().set_name("bq-sync"))
+            .set_commit_message("Saved")
+            .send()
+            .await
+            .map_err(gax_error)?;
+        client
+            .push_git_commits()
+            .set_name(workspace)
+            .send()
+            .await
+            .map_err(gax_error)?;
+        Ok(())
+    }
+
     async fn create_default_workspace(&self, project: &str, repo: &str) -> Result<String> {
         let ws = self
             .dataform(project)
@@ -902,7 +924,11 @@ impl GcpClient {
             .await?
             .create_repository()
             .set_parent(format!("projects/{project}/locations/{region}"))
-            .set_repository(df::Repository::new().set_display_name(name))
+            .set_repository(
+                df::Repository::new()
+                    .set_display_name(name)
+                    .set_labels([(SAVED_QUERY_LABEL.0, SAVED_QUERY_LABEL.1)]),
+            )
             .set_repository_id(repository_id(name))
             .send()
             .await
@@ -910,6 +936,7 @@ impl GcpClient {
         self.repositories.lock().unwrap().clear();
         let ws = self.create_default_workspace(project, &repo.name).await?;
         self.write_saved_sql(project, &ws, sql).await?;
+        self.commit_saved_query(project, &ws).await?;
         log::info!("Created saved query '{name}'");
         Ok(())
     }
@@ -932,6 +959,7 @@ impl GcpClient {
             None => self.create_default_workspace(project, &repo.name).await?,
         };
         self.write_saved_sql(project, &ws, sql).await?;
+        self.commit_saved_query(project, &ws).await?;
         log::info!("Updated saved query '{name}'");
         Ok(())
     }
@@ -1067,6 +1095,24 @@ impl BqApi for GcpClient {
                 .map_err(gax_error)
         })?;
         self.update_cached_transfer_config(name, |tc| tc.query = sql.to_owned());
+        Ok(())
+    }
+
+    fn delete_transfer_config(&self, project: &str, name: &str) -> Result<()> {
+        self.block_on(async {
+            self.transfer(project)
+                .await?
+                .delete_transfer_config()
+                .set_name(name)
+                .send()
+                .await
+                .map_err(gax_error)
+        })?;
+        self.transfer_configs
+            .lock()
+            .unwrap()
+            .values_mut()
+            .for_each(|configs| configs.retain(|tc| tc.name != name));
         Ok(())
     }
 
@@ -1431,6 +1477,10 @@ fn http_error(status: u16, body: &[u8]) -> Error {
 }
 
 /// Dataform repository IDs must be URL-safe (lowercase, hyphens).
+/// Label that distinguishes a BigQuery Studio saved query from any other
+/// Dataform repository.
+const SAVED_QUERY_LABEL: (&str, &str) = ("single-file-asset-type", "sql");
+
 fn repository_id(name: &str) -> String {
     REPO_ID_RE
         .replace_all(&name.to_lowercase(), "-")

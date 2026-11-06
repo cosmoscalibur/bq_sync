@@ -75,6 +75,10 @@ impl BqApi for FakeApi {
         self.record(format!("update_query {name} {sql}"));
         Ok(())
     }
+    fn delete_transfer_config(&self, _: &str, name: &str) -> Result<()> {
+        self.record(format!("delete_transfer_config {name}"));
+        Ok(())
+    }
     fn fetch_table_to_file(
         &self,
         p: &str,

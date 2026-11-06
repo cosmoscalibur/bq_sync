@@ -170,7 +170,11 @@ that name.
 ### rm options
 
 Deletes the BQ resource first, then removes the local file on success.
-Scheduled query files are skipped with a warning.
+A scheduled query is resolved by the name in its `-- Scheduled Query:` header
+(several scheduled queries with the same name are an error). Its settings other
+than SQL and schedule are not stored in git, so the deletion cannot be undone
+from the repository; without `--yes` the confirmation prompt applies. If the
+scheduled query no longer exists in BigQuery, only the local file is removed.
 
 | Flag | Description |
 | --- | --- |
@@ -224,7 +228,10 @@ cause `bq-sync` to **warn and exit**. All files must be committed first.
 
 Saved queries are read and written through the Dataform API as the
 `content.sql` file of the first workspace of the repository whose display
-name matches the saved query.
+name matches the saved query. A saved query created by `push` gets the label
+`single-file-asset-type: sql` (what BigQuery Studio uses to list it), and every
+`push` of a saved query commits and pushes the workspace with the message
+`Saved`, so Studio finds its history.
 
 ## Python API
 

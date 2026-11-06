@@ -51,6 +51,9 @@ pub trait BqApi {
     /// keeping its other parameters.
     fn update_transfer_config_query(&self, project: &str, name: &str, sql: &str) -> Result<()>;
 
+    /// Delete a transfer config by resource name.
+    fn delete_transfer_config(&self, project: &str, name: &str) -> Result<()>;
+
     fn list_scheduled_queries(
         &self,
         project: &str,
@@ -124,6 +127,22 @@ pub trait BqApi {
         self.update_transfer_config_query(project, &tc.name, sql)?;
         log::info!("Updated SQL for scheduled query '{display_name}'.");
         Ok(())
+    }
+
+    /// Delete the scheduled query named *display_name*.  Returns ``false``
+    /// when no such scheduled query exists.
+    fn delete_scheduled_query(
+        &self,
+        project: &str,
+        region: &str,
+        display_name: &str,
+    ) -> Result<bool> {
+        let Some(tc) = self.get_transfer_config(project, region, display_name)? else {
+            return Ok(false);
+        };
+        self.delete_transfer_config(project, &tc.name)?;
+        log::info!("Deleted scheduled query '{display_name}'.");
+        Ok(true)
     }
 
     /// Trigger an immediate manual run of the scheduled query.

@@ -5,6 +5,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- `rm` deletes scheduled queries (Data Transfer transfer configs) resolved
+  by their `-- Scheduled Query:` header name, then removes the local file.
+  If the scheduled query no longer exists remotely, only the local file is
+  removed.
+
+### Fixed
+
+- `push` creates new saved queries with the `single-file-asset-type: sql`
+  label, so BigQuery Studio lists them.
+- `push` commits and pushes the Dataform workspace when creating or
+  updating a saved query, so Studio no longer fails with "no commits found".
+
 ## [0.3.0] - 2026-11-05
 
 ### Added
