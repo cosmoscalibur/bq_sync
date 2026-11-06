@@ -14,6 +14,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
 - `push` of an existing scheduled query also updates its schedule when the
   `-- Schedule:` header differs (previously only the SQL was pushed).
 
+### Fixed
+
+- `check` no longer aborts with a `PanicException` on tables with
+  `STRUCT`/`RECORD`/`ARRAY` columns (e.g. Datastream's `datastream_metadata`).
+  Columns whose type `inbq` cannot represent are left out of the local
+  catalog, duplicate column names are dropped, and any remaining `inbq` panic
+  is reported as a lineage warning (#8).
+
 ## [0.3.1] - 2026-11-06
 
 ### Added

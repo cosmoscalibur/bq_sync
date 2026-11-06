@@ -223,13 +223,22 @@ pub fn build_catalog(output_root: &Path, project: &str) -> Catalog {
                 .and_then(Path::file_name)
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            // ``inbq`` panics on bare ``struct``/``array`` dtypes (the model
+            // YAML carries no nested field definitions) and on duplicate
+            // column names, so such columns are left out of the catalog.
+            let mut seen = HashSet::new();
             let columns = fields
                 .into_iter()
                 .map(|(name, dtype)| Column {
                     name,
                     dtype: map_bq_type(if dtype.is_empty() { "STRING" } else { &dtype }),
                 })
-                .collect();
+                .filter(|c| !matches!(c.dtype.as_str(), "struct" | "array"))
+                .filter(|c| seen.insert(c.name.clone()))
+                .collect::<Vec<_>>();
+            if columns.is_empty() {
+                continue;
+            }
             schema_objects.push(SchemaObject {
                 name: format!("{project}.{dataset}.{table}"),
                 kind: SchemaObjectKind::Table { columns },
@@ -600,9 +609,14 @@ pub fn check_lineage(sql: &str, path: &Path, catalog: &Catalog) -> CheckResult {
             return result.settle();
         }
     };
-    let lineage = inbq::lineage::extract_lineage(&[&ast], catalog, false, false)
-        .pop()
-        .unwrap_or_else(|| Err(anyhow::anyhow!("no lineage produced")));
+    // ``inbq`` panics on schemas it cannot represent; report that as a
+    // handled warning instead of aborting the whole check.
+    let lineage = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        inbq::lineage::extract_lineage(&[&ast], catalog, false, false)
+            .pop()
+            .unwrap_or_else(|| Err(anyhow::anyhow!("no lineage produced")))
+    }))
+    .unwrap_or_else(|_| Err(anyhow::anyhow!("unsupported schema in local catalog")));
     let lineage = match lineage {
         Ok(l) => l,
         Err(e) => {
@@ -868,6 +882,23 @@ mod tests {
 
         let empty = tempfile::tempdir().unwrap();
         assert!(build_catalog(empty.path(), "p").schema_objects.is_empty());
+    }
+
+    #[test]
+    fn struct_columns_do_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("p");
+        w(
+            &root.join("d/models/t.yaml"),
+            "name: t\nschema:\n  - name: id  type: INTEGER\n  - name: datastream_metadata  type: RECORD\n  - name: tags  type: ARRAY\n  - name: id  type: INTEGER\n",
+        );
+        let cat = build_catalog(&root, "p");
+        let SchemaObjectKind::Table { columns } = &cat.schema_objects[0].kind else {
+            panic!("expected table")
+        };
+        assert_eq!(columns.len(), 1);
+        let r = check_lineage("SELECT id FROM `p.d.t`", Path::new("t.sql"), &cat);
+        assert_ne!(r.level, Level::Error);
     }
 
     #[test]
