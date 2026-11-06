@@ -562,6 +562,16 @@ pub fn rm_file(api: &dyn BqApi, item: &ClassifiedFile, project: &str, region: &s
             let u = readers::read_saved_query_sql(file)?;
             api.delete_saved_query(project, region, &u.name)?;
         }
+        (SCHEDULED_QUERY_DIR, "sql") => {
+            let u = readers::read_scheduled_query_sql(file)?;
+            if !api.delete_scheduled_query(project, region, &u.name)? {
+                log::warn!(
+                    "Scheduled query '{}' not found in {project}/{region}; \
+                     removing the local file only.",
+                    u.name
+                );
+            }
+        }
         _ => {
             log::warn!(
                 "Unsupported resource type/extension for rm, skipping: {}",
@@ -584,15 +594,7 @@ pub fn rm_resources(
     opts: &PushOptions,
 ) -> Result<()> {
     let output_root = resolve_output_dir(config, config_path);
-    let (scheduled, removable): (Vec<_>, Vec<_>) = classify_args(paths, &output_root)
-        .into_iter()
-        .partition(|f| f.class.resource_type == SCHEDULED_QUERY_DIR);
-    for f in &scheduled {
-        log::warn!(
-            "rm does not delete scheduled queries, skipping: {}",
-            f.path.display()
-        );
-    }
+    let removable = classify_args(paths, &output_root);
 
     if removable.is_empty() {
         log::info!("Nothing to remove.");
@@ -931,12 +933,42 @@ mod tests {
     }
 
     #[test]
-    fn rm_skips_scheduled_queries() {
+    fn rm_deletes_scheduled_query_then_local_file() {
         let dir = tempfile::tempdir().unwrap();
         let (cfg, root) = tree(dir.path());
         let sq = write(
             &root.join("scheduled_queries/daily_load.sql"),
             "-- Scheduled Query: daily_load\n\nSELECT 1\n",
+        );
+        let api = FakeApi::default();
+        api.transfer_configs
+            .borrow_mut()
+            .push(crate::resources::TransferConfig {
+                name: "projects/1/locations/us/transferConfigs/abc".into(),
+                display_name: "daily_load".into(),
+                data_source_id: "scheduled_query".into(),
+                ..Default::default()
+            });
+        let yes = PushOptions {
+            yes: true,
+            ..Default::default()
+        };
+        let paths = [sq.to_string_lossy().into_owned()];
+        rm_resources(&api, &config(), &cfg, &paths, &yes).unwrap();
+        assert_eq!(
+            api.calls(),
+            vec!["delete_transfer_config projects/1/locations/us/transferConfigs/abc"]
+        );
+        assert!(!sq.exists());
+    }
+
+    #[test]
+    fn rm_scheduled_query_missing_remotely_removes_local_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, root) = tree(dir.path());
+        let sq = write(
+            &root.join("scheduled_queries/gone.sql"),
+            "-- Scheduled Query: gone\n\nSELECT 1\n",
         );
         let api = FakeApi::default();
         let yes = PushOptions {
@@ -945,7 +977,7 @@ mod tests {
         };
         let paths = [sq.to_string_lossy().into_owned()];
         rm_resources(&api, &config(), &cfg, &paths, &yes).unwrap();
-        assert!(api.calls().is_empty() && sq.exists());
+        assert!(api.calls().is_empty() && !sq.exists());
     }
 
     #[test]

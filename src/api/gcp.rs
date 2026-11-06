@@ -876,6 +876,39 @@ impl GcpClient {
         Ok(saved.into_iter().flatten().collect())
     }
 
+    /// Commit and push the workspace so the content is part of the
+    /// repository history; BigQuery Studio cannot load a saved query whose
+    /// content is only an uncommitted workspace change.
+    async fn commit_saved_query(&self, project: &str, workspace: &str) -> Result<()> {
+        let client = self.dataform(project).await?;
+        // Also repairs saved queries left uncommitted by earlier versions;
+        // committing with nothing pending would be an API error.
+        let status = client
+            .fetch_file_git_statuses()
+            .set_name(workspace)
+            .send()
+            .await
+            .map_err(gax_error)?;
+        if status.uncommitted_file_changes.is_empty() {
+            return Ok(());
+        }
+        client
+            .commit_workspace_changes()
+            .set_name(workspace)
+            .set_author(commit_author())
+            .set_commit_message("Saved")
+            .send()
+            .await
+            .map_err(gax_error)?;
+        client
+            .push_git_commits()
+            .set_name(workspace)
+            .send()
+            .await
+            .map_err(gax_error)?;
+        Ok(())
+    }
+
     async fn create_default_workspace(&self, project: &str, repo: &str) -> Result<String> {
         let ws = self
             .dataform(project)
@@ -902,7 +935,11 @@ impl GcpClient {
             .await?
             .create_repository()
             .set_parent(format!("projects/{project}/locations/{region}"))
-            .set_repository(df::Repository::new().set_display_name(name))
+            .set_repository(
+                df::Repository::new()
+                    .set_display_name(name)
+                    .set_labels([(SAVED_QUERY_LABEL.0, SAVED_QUERY_LABEL.1)]),
+            )
             .set_repository_id(repository_id(name))
             .send()
             .await
@@ -910,6 +947,7 @@ impl GcpClient {
         self.repositories.lock().unwrap().clear();
         let ws = self.create_default_workspace(project, &repo.name).await?;
         self.write_saved_sql(project, &ws, sql).await?;
+        self.commit_saved_query(project, &ws).await?;
         log::info!("Created saved query '{name}'");
         Ok(())
     }
@@ -932,6 +970,7 @@ impl GcpClient {
             None => self.create_default_workspace(project, &repo.name).await?,
         };
         self.write_saved_sql(project, &ws, sql).await?;
+        self.commit_saved_query(project, &ws).await?;
         log::info!("Updated saved query '{name}'");
         Ok(())
     }
@@ -1067,6 +1106,74 @@ impl BqApi for GcpClient {
                 .map_err(gax_error)
         })?;
         self.update_cached_transfer_config(name, |tc| tc.query = sql.to_owned());
+        Ok(())
+    }
+
+    fn run_transfer_config_and_wait(&self, project: &str, name: &str) -> Result<()> {
+        self.block_on(async {
+            let client = self.transfer(project).await?;
+            let now = Utc::now();
+            let ts = google_cloud_wkt::Timestamp::clamp(
+                now.timestamp(),
+                now.timestamp_subsec_nanos() as i32,
+            );
+            let started = client
+                .start_manual_transfer_runs()
+                .set_parent(name)
+                .set_requested_run_time(ts)
+                .send()
+                .await
+                .map_err(gax_error)?;
+            let run = started
+                .runs
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::Invalid(format!("No run started for '{name}'.")))?;
+            let deadline = tokio::time::Instant::now() + TRANSFER_RUN_TIMEOUT;
+            loop {
+                let current = client
+                    .get_transfer_run()
+                    .set_name(&run.name)
+                    .send()
+                    .await
+                    .map_err(gax_error)?;
+                match current.state {
+                    dts::TransferState::Succeeded => return Ok(()),
+                    dts::TransferState::Failed | dts::TransferState::Cancelled => {
+                        let detail = current.error_status.map(|s| s.message).unwrap_or_default();
+                        return Err(Error::Invalid(format!(
+                            "Scheduled query run {} ended as {:?}: {detail}",
+                            run.name, current.state
+                        )));
+                    }
+                    _ => {}
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(Error::Invalid(format!(
+                        "Timed out waiting for scheduled query run {}.",
+                        run.name
+                    )));
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        })
+    }
+
+    fn delete_transfer_config(&self, project: &str, name: &str) -> Result<()> {
+        self.block_on(async {
+            self.transfer(project)
+                .await?
+                .delete_transfer_config()
+                .set_name(name)
+                .send()
+                .await
+                .map_err(gax_error)
+        })?;
+        self.transfer_configs
+            .lock()
+            .unwrap()
+            .values_mut()
+            .for_each(|configs| configs.retain(|tc| tc.name != name));
         Ok(())
     }
 
@@ -1431,6 +1538,64 @@ fn http_error(status: u16, body: &[u8]) -> Error {
 }
 
 /// Dataform repository IDs must be URL-safe (lowercase, hyphens).
+const TOOL_NAME: &str = "bq-sync";
+
+/// Output of ``program args``, trimmed; ``None`` on failure or empty output.
+fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!text.is_empty()).then_some(text)
+}
+
+/// Commit author as ``(name, email)``: the git identity when configured,
+/// else the active gcloud account, with the tool appended to the name
+/// (``Jane Doe (bq-sync)``) so commits stay attributable to the user.
+fn author_identity(
+    git_name: Option<String>,
+    git_email: Option<String>,
+    gcloud_account: impl FnOnce() -> Option<String>,
+) -> (String, String) {
+    let (name, email) = match (git_name, git_email) {
+        (Some(n), e) => (n, e.unwrap_or_default()),
+        (None, e) => match e.or_else(gcloud_account) {
+            Some(account) => (account.clone(), account),
+            None => (String::new(), String::new()),
+        },
+    };
+    let name = if name.is_empty() {
+        TOOL_NAME.to_owned()
+    } else {
+        format!("{name} ({TOOL_NAME})")
+    };
+    (name, email)
+}
+
+fn commit_author() -> df::CommitAuthor {
+    static IDENTITY: LazyLock<(String, String)> = LazyLock::new(|| {
+        author_identity(
+            command_output("git", &["config", "user.name"]),
+            command_output("git", &["config", "user.email"]),
+            || command_output("gcloud", &["config", "get-value", "account", "--quiet"]),
+        )
+    });
+    df::CommitAuthor::new()
+        .set_name(IDENTITY.0.clone())
+        .set_email_address(IDENTITY.1.clone())
+}
+
+/// Longest wait for a manual scheduled query run to finish.
+const TRANSFER_RUN_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// Label that distinguishes a BigQuery Studio saved query from any other
+/// Dataform repository.
+const SAVED_QUERY_LABEL: (&str, &str) = ("single-file-asset-type", "sql");
+
 fn repository_id(name: &str) -> String {
     REPO_ID_RE
         .replace_all(&name.to_lowercase(), "-")
@@ -1622,6 +1787,25 @@ fn sql_type(name: &str) -> bq::StandardSqlDataType {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn author_identity_prefers_git_then_gcloud() {
+        use super::author_identity as id;
+        let some = |s: &str| Some(s.to_owned());
+        assert_eq!(
+            id(some("Edward Villegas"), some("e@x.co"), || some("g@x.co")),
+            ("Edward Villegas (bq-sync)".into(), "e@x.co".into())
+        );
+        assert_eq!(
+            id(None, None, || some("g@x.co")),
+            ("g@x.co (bq-sync)".into(), "g@x.co".into())
+        );
+        assert_eq!(
+            id(None, some("e@x.co"), || None),
+            ("e@x.co (bq-sync)".into(), "e@x.co".into())
+        );
+        assert_eq!(id(None, None, || None), ("bq-sync".into(), String::new()));
+    }
+
     use super::*;
 
     #[test]

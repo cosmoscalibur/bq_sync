@@ -5,6 +5,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-06
+
+### Added
+
+- `rm` deletes scheduled queries (Data Transfer transfer configs) resolved
+  by their `-- Scheduled Query:` header name, then removes the local file.
+  If the scheduled query no longer exists remotely, only the local file is
+  removed.
+- `materialize` accepts either name of the view/materialize pair
+  (`view_x` / `external_x` or `materialize_x`). If a scheduled query named
+  after the target exists, it is run (and awaited) instead of the generic
+  `SELECT *` DDL, preserving its customization (`CLUSTER BY`, partitioning,
+  options); then the model YAML is refreshed. Without it the behavior is
+  unchanged.
+
+### Fixed
+
+- `push` creates new saved queries with the `single-file-asset-type: sql`
+  label, so BigQuery Studio lists them.
+- `push` commits and pushes the Dataform workspace when creating or
+  updating a saved query, so Studio no longer fails with "no commits found".
+  Changes left uncommitted by earlier versions are committed on the next
+  push of that file. The commit author is the git user (or the active gcloud
+  account) followed by `(bq-sync)`, e.g. `Edward Villegas (bq-sync)`.
+
 ## [0.3.0] - 2026-11-05
 
 ### Added

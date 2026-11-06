@@ -53,7 +53,7 @@ pub struct RoutineDefinition<'a> {
 }
 
 /// A BigQuery view definition.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ViewInfo {
     pub name: String,
     pub sql: String,

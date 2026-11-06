@@ -14,31 +14,40 @@ Each release (`vX.Y.Z`) attaches the CLI binaries
 macOS arm64 and Windows x86_64), Python wheels (abi3, CPython ≥ 3.12) for the
 same platforms, an sdist and `SHA256SUMS`.
 
-Install the CLI as a uv tool. `--find-links` points uv at the release's
-asset list and it picks the wheel matching your platform:
+`--find-links` points uv at the release's asset list and it picks the wheel
+matching your platform; no Rust toolchain is needed.
+
+Run it without installing (`uvx`):
+
+```zsh
+uvx --find-links https://github.com/cosmoscalibur/bq_sync/releases/expanded_assets/v0.3.1 \
+  bq-sync --help
+```
+
+Install it as a uv tool:
 
 ```zsh
 uv tool install bq-sync \
-  --find-links https://github.com/cosmoscalibur/bq_sync/releases/expanded_assets/v0.3.0
+  --find-links https://github.com/cosmoscalibur/bq_sync/releases/expanded_assets/v0.3.1
 ```
 
 Use it as a library in a project (`import bq_sync`):
 
 ```zsh
 uv add bq-sync \
-  --find-links https://github.com/cosmoscalibur/bq_sync/releases/expanded_assets/v0.3.0
+  --find-links https://github.com/cosmoscalibur/bq_sync/releases/expanded_assets/v0.3.1
 ```
 
 or install a specific wheel by URL (copy it from the release page):
 
 ```zsh
-uv tool install https://github.com/cosmoscalibur/bq_sync/releases/download/v0.3.0/<wheel-file>.whl
+uv tool install https://github.com/cosmoscalibur/bq_sync/releases/download/v0.3.1/<wheel-file>.whl
 ```
 
 To upgrade, rerun the command with the new tag.
-The wheel-based install needs no Rust toolchain. To use the standalone
-binary instead, download the archive for your platform from the release,
-verify it against `SHA256SUMS`, extract it and put `bq-sync` on your `PATH`.
+To use the standalone binary instead, download the archive for your platform
+from the release, verify it against `SHA256SUMS`, extract it and put `bq-sync`
+on your `PATH`.
 
 ### From source
 
@@ -167,10 +176,27 @@ that name.
 | `-y`, `--yes` | Skip interactive confirmation |
 | `--config` | Path to `bq_sync.toml` (default: auto-discover from CWD upward) |
 
+### materialize
+
+Creates `<dataset>.<target>` from a view or external table and refreshes the
+model YAML. The resource can be given by either name of the pair: `view_x` /
+`external_x` (target `materialize_x`) or `materialize_x` itself (the source is
+the existing `view_x` or `external_x`).
+
+If a scheduled query named after the target exists (the `-- Scheduled Query:`
+header of its file, e.g. `materialize_x`), `materialize` runs that scheduled
+query and waits for it instead of the generic
+`CREATE OR REPLACE TABLE … AS SELECT *`, so customizations such as `CLUSTER BY`
+or partitioning are kept. Without it, the generic DDL runs.
+
 ### rm options
 
 Deletes the BQ resource first, then removes the local file on success.
-Scheduled query files are skipped with a warning.
+A scheduled query is resolved by the name in its `-- Scheduled Query:` header
+(several scheduled queries with the same name are an error). Its settings other
+than SQL and schedule are not stored in git, so the deletion cannot be undone
+from the repository; without `--yes` the confirmation prompt applies. If the
+scheduled query no longer exists in BigQuery, only the local file is removed.
 
 | Flag | Description |
 | --- | --- |
@@ -224,7 +250,15 @@ cause `bq-sync` to **warn and exit**. All files must be committed first.
 
 Saved queries are read and written through the Dataform API as the
 `content.sql` file of the first workspace of the repository whose display
-name matches the saved query.
+name matches the saved query. A saved query created by `push` gets the label
+`single-file-asset-type: sql` (what BigQuery Studio uses to list it), and every
+`push` of a saved query commits and pushes the workspace with the message
+`Saved`, so Studio finds its history. The commit author is the git identity
+(`git config user.name` / `user.email`), or the active gcloud account when git
+has none, with the tool appended: `Edward Villegas (bq-sync)`. Saved queries left uncommitted by
+earlier versions are committed the next time they are pushed by path
+(`bq-sync push saved_queries/<name>.sql`), even if their content did not
+change.
 
 ## Python API
 
