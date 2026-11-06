@@ -11,6 +11,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
   by their `-- Scheduled Query:` header name, then removes the local file.
   If the scheduled query no longer exists remotely, only the local file is
   removed.
+- `materialize` runs the scheduled query that already creates the target
+  table (a `CREATE [OR REPLACE] TABLE` on it) instead of the generic
+  `SELECT *` DDL, preserving its customization (`CLUSTER BY`, partitioning,
+  options). It waits for the run to finish and then refreshes the model
+  YAML. Without such a scheduled query the behavior is unchanged; several
+  matches are an error.
+
+### Changed
+
+- Standalone CLI binaries are no longer built or released; bq-sync is
+  distributed as Python wheels and an sdist and runs with `uvx` or
+  `uv tool install`. The `bq-sync` Cargo binary target is removed.
 
 ### Fixed
 
@@ -18,6 +30,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
   label, so BigQuery Studio lists them.
 - `push` commits and pushes the Dataform workspace when creating or
   updating a saved query, so Studio no longer fails with "no commits found".
+  Changes left uncommitted by earlier versions are committed on the next
+  push of that file.
 
 ## [0.3.0] - 2026-11-05
 

@@ -12,10 +12,6 @@ repository = "https://github.com/cosmoscalibur/bq_sync"
 name = "bq_sync"
 crate-type = ["cdylib", "rlib"]
 
-[[bin]]
-name = "bq-sync"
-path = "src/main.rs"
-
 [features]
 default = []
 # Builds the `bq_sync._bq_sync` Python extension module (used by maturin).

@@ -4,18 +4,25 @@ Sync BigQuery resources to a local directory structure.
 
 ## Install
 
-`bq-sync` is written in Rust and ships both as a native binary and as a
-Python package (PyO3 extension, one abi3 wheel for CPython ≥ 3.12).
+`bq-sync` is written in Rust and distributed as a Python tool (PyO3
+extension, one abi3 wheel for CPython ≥ 3.12). There are no standalone
+binaries.
 
 ### From a GitHub release
 
-Each release (`vX.Y.Z`) attaches the CLI binaries
-(`bq-sync-vX.Y.Z-<target>.tar.gz` / `.zip` for Linux x86_64 and arm64,
-macOS arm64 and Windows x86_64), Python wheels (abi3, CPython ≥ 3.12) for the
-same platforms, an sdist and `SHA256SUMS`.
+Each release (`vX.Y.Z`) attaches Python wheels (abi3, CPython ≥ 3.12) for
+Linux x86_64/arm64, macOS arm64 and Windows x86_64, an sdist and
+`SHA256SUMS`. `--find-links` points uv at the release's asset list and it
+picks the wheel matching your platform; no Rust toolchain is needed.
 
-Install the CLI as a uv tool. `--find-links` points uv at the release's
-asset list and it picks the wheel matching your platform:
+Run it without installing (`uvx`):
+
+```zsh
+uvx --find-links https://github.com/cosmoscalibur/bq_sync/releases/expanded_assets/v0.3.0 \
+  bq-sync --help
+```
+
+Install it as a uv tool:
 
 ```zsh
 uv tool install bq-sync \
@@ -36,20 +43,13 @@ uv tool install https://github.com/cosmoscalibur/bq_sync/releases/download/v0.3.
 ```
 
 To upgrade, rerun the command with the new tag.
-The wheel-based install needs no Rust toolchain. To use the standalone
-binary instead, download the archive for your platform from the release,
-verify it against `SHA256SUMS`, extract it and put `bq-sync` on your `PATH`.
 
 ### From source
 
 ```zsh
-# Python package (provides the `bq-sync` command and `import bq_sync`)
 uv tool install .
 # or
 pip install .
-
-# Native binary only
-cargo install --path .
 ```
 
 Building from source requires Rust 1.99 (pinned in `rust-toolchain.toml`)
@@ -167,6 +167,16 @@ that name.
 | `-y`, `--yes` | Skip interactive confirmation |
 | `--config` | Path to `bq_sync.toml` (default: auto-discover from CWD upward) |
 
+### materialize
+
+Creates `<dataset>.<target>` from the view or external table (default target:
+`view_x` / `external_x` become `materialize_x`) and refreshes the model YAML.
+If a scheduled query already creates the target (a `CREATE [OR REPLACE] TABLE`
+on it), `materialize` runs that scheduled query and waits for it instead of
+the generic `CREATE OR REPLACE TABLE … AS SELECT *`, so customizations such as
+`CLUSTER BY` or partitioning are kept. Several matching scheduled queries are
+an error.
+
 ### rm options
 
 Deletes the BQ resource first, then removes the local file on success.
@@ -231,7 +241,10 @@ Saved queries are read and written through the Dataform API as the
 name matches the saved query. A saved query created by `push` gets the label
 `single-file-asset-type: sql` (what BigQuery Studio uses to list it), and every
 `push` of a saved query commits and pushes the workspace with the message
-`Saved`, so Studio finds its history.
+`Saved`, so Studio finds its history. Saved queries left uncommitted by
+earlier versions are committed the next time they are pushed by path
+(`bq-sync push saved_queries/<name>.sql`), even if their content did not
+change.
 
 ## Python API
 
@@ -262,7 +275,7 @@ maturin develop --uv            # build the extension into the venv
 pytest                          # Python binding tests
 ```
 
-Layout: `src/` (Rust crate: library, `bq-sync` binary, PyO3 module in
+Layout: `src/` (Rust crate: library, PyO3 module in
 `src/python.rs` behind the `python` feature), `python/bq_sync/` (Python
 package shim and stubs), `tests/` (Python binding tests).
 

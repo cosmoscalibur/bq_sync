@@ -75,6 +75,10 @@ impl BqApi for FakeApi {
         self.record(format!("update_query {name} {sql}"));
         Ok(())
     }
+    fn run_transfer_config_and_wait(&self, _: &str, name: &str) -> Result<()> {
+        self.record(format!("run_transfer_and_wait {name}"));
+        Ok(())
+    }
     fn delete_transfer_config(&self, _: &str, name: &str) -> Result<()> {
         self.record(format!("delete_transfer_config {name}"));
         Ok(())

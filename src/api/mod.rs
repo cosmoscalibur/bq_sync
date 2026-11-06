@@ -51,6 +51,10 @@ pub trait BqApi {
     /// keeping its other parameters.
     fn update_transfer_config_query(&self, project: &str, name: &str, sql: &str) -> Result<()>;
 
+    /// Start a manual run of a transfer config (by resource name) and wait
+    /// until it finishes; a failed or cancelled run is an error.
+    fn run_transfer_config_and_wait(&self, project: &str, name: &str) -> Result<()>;
+
     /// Delete a transfer config by resource name.
     fn delete_transfer_config(&self, project: &str, name: &str) -> Result<()>;
 
@@ -143,6 +147,32 @@ pub trait BqApi {
         self.delete_transfer_config(project, &tc.name)?;
         log::info!("Deleted scheduled query '{display_name}'.");
         Ok(true)
+    }
+
+    /// The scheduled query that (re)creates the table
+    /// ``project.dataset.table`` (a ``CREATE [OR REPLACE] TABLE`` on it).
+    /// Several matches are an error because the one to run is ambiguous.
+    fn find_materializing_query(
+        &self,
+        project: &str,
+        region: &str,
+        dataset: &str,
+        table: &str,
+    ) -> Result<Option<TransferConfig>> {
+        let re = crate::utils::create_table_regex(project, dataset, table);
+        let mut matches = self
+            .list_transfer_configs(project, region)?
+            .into_iter()
+            .filter(|tc| re.is_match(&tc.query));
+        let found = matches.next();
+        if let Some(other) = matches.next() {
+            return Err(crate::Error::Invalid(format!(
+                "Several scheduled queries create {project}.{dataset}.{table}: '{}' and '{}'.",
+                found.map(|f| f.display_name).unwrap_or_default(),
+                other.display_name
+            )));
+        }
+        Ok(found)
     }
 
     /// Trigger an immediate manual run of the scheduled query.

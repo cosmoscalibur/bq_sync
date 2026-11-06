@@ -881,6 +881,17 @@ impl GcpClient {
     /// content is only an uncommitted workspace change.
     async fn commit_saved_query(&self, project: &str, workspace: &str) -> Result<()> {
         let client = self.dataform(project).await?;
+        // Also repairs saved queries left uncommitted by earlier versions;
+        // committing with nothing pending would be an API error.
+        let status = client
+            .fetch_file_git_statuses()
+            .set_name(workspace)
+            .send()
+            .await
+            .map_err(gax_error)?;
+        if status.uncommitted_file_changes.is_empty() {
+            return Ok(());
+        }
         client
             .commit_workspace_changes()
             .set_name(workspace)
@@ -1096,6 +1107,56 @@ impl BqApi for GcpClient {
         })?;
         self.update_cached_transfer_config(name, |tc| tc.query = sql.to_owned());
         Ok(())
+    }
+
+    fn run_transfer_config_and_wait(&self, project: &str, name: &str) -> Result<()> {
+        self.block_on(async {
+            let client = self.transfer(project).await?;
+            let now = Utc::now();
+            let ts = google_cloud_wkt::Timestamp::clamp(
+                now.timestamp(),
+                now.timestamp_subsec_nanos() as i32,
+            );
+            let started = client
+                .start_manual_transfer_runs()
+                .set_parent(name)
+                .set_requested_run_time(ts)
+                .send()
+                .await
+                .map_err(gax_error)?;
+            let run = started
+                .runs
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::Invalid(format!("No run started for '{name}'.")))?;
+            let deadline = tokio::time::Instant::now() + TRANSFER_RUN_TIMEOUT;
+            loop {
+                let current = client
+                    .get_transfer_run()
+                    .set_name(&run.name)
+                    .send()
+                    .await
+                    .map_err(gax_error)?;
+                match current.state {
+                    dts::TransferState::Succeeded => return Ok(()),
+                    dts::TransferState::Failed | dts::TransferState::Cancelled => {
+                        let detail = current.error_status.map(|s| s.message).unwrap_or_default();
+                        return Err(Error::Invalid(format!(
+                            "Scheduled query run {} ended as {:?}: {detail}",
+                            run.name, current.state
+                        )));
+                    }
+                    _ => {}
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(Error::Invalid(format!(
+                        "Timed out waiting for scheduled query run {}.",
+                        run.name
+                    )));
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        })
     }
 
     fn delete_transfer_config(&self, project: &str, name: &str) -> Result<()> {
@@ -1477,6 +1538,9 @@ fn http_error(status: u16, body: &[u8]) -> Error {
 }
 
 /// Dataform repository IDs must be URL-safe (lowercase, hyphens).
+/// Longest wait for a manual scheduled query run to finish.
+const TRANSFER_RUN_TIMEOUT: Duration = Duration::from_secs(3600);
+
 /// Label that distinguishes a BigQuery Studio saved query from any other
 /// Dataform repository.
 const SAVED_QUERY_LABEL: (&str, &str) = ("single-file-asset-type", "sql");

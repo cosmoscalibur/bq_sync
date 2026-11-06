@@ -59,10 +59,22 @@ pub fn materialize_resource(
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| default_target_name(&source));
     let ddl = build_ddl(&project, &dataset, &source, &target);
+    // A scheduled query that already creates the target carries the
+    // materialization's own DDL (e.g. CLUSTER BY / PARTITION BY); running it
+    // keeps that customization, which the generic DDL would drop.
+    let scheduled = api.find_materializing_query(&project, location, &dataset, &target)?;
 
     println!("\n  Source : {project}.{dataset}.{source}");
     println!("  Target : {project}.{dataset}.{target}");
-    println!("\n  DDL:\n\n    {}\n", ddl.replace('\n', "\n    "));
+    match &scheduled {
+        Some(tc) => println!(
+            "\n  Scheduled query '{}' creates the target; it will be run \
+             instead of the generic DDL:\n\n    {}\n",
+            tc.display_name,
+            tc.query.trim().replace('\n', "\n    ")
+        ),
+        None => println!("\n  DDL:\n\n    {}\n", ddl.replace('\n', "\n    ")),
+    }
 
     if opts.dry_run {
         log::info!("Dry-run: no changes written.");
@@ -74,7 +86,10 @@ pub fn materialize_resource(
     }
 
     log::info!("Materializing {project}.{dataset}.{source} -> {target} …");
-    api.run_query(&project, &ddl, Some(location))?;
+    match &scheduled {
+        Some(tc) => api.run_transfer_config_and_wait(&project, &tc.name)?,
+        None => api.run_query(&project, &ddl, Some(location))?,
+    }
     log::info!("Materialization complete.");
 
     log::info!("Pulling model YAML for '{target}' …");
@@ -148,6 +163,27 @@ mod tests {
         let calls = api.calls();
         assert_eq!(calls[0], "run_query proj @Some(\"us-east1\")");
         assert_eq!(calls[1], "get_table_info proj.ds.materialize_x");
+
+        // A scheduled query creating the target is run instead of the DDL.
+        api.transfer_configs
+            .borrow_mut()
+            .push(crate::resources::TransferConfig {
+                name: "projects/1/locations/us-east1/transferConfigs/9".into(),
+                display_name: "refresh_x".into(),
+                data_source_id: "scheduled_query".into(),
+                query: "CREATE OR REPLACE TABLE `proj.ds.materialize_x`\nCLUSTER BY a AS SELECT 1"
+                    .into(),
+                ..Default::default()
+            });
+        let before = api.calls().len();
+        materialize_resource(&api, &config(), &cfg, "proj/ds/view_x", &opts).unwrap();
+        assert_eq!(
+            api.calls()[before..],
+            [
+                "run_transfer_and_wait projects/1/locations/us-east1/transferConfigs/9",
+                "get_table_info proj.ds.materialize_x"
+            ]
+        );
 
         let custom = MaterializeOptions {
             yes: true,
