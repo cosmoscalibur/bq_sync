@@ -31,7 +31,7 @@ jobs:
         include:
           - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, ext: tar.gz }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, ext: tar.gz }
-          - { os: macos-14, target: aarch64-apple-darwin, ext: tar.gz }
+          - { os: macos-15, target: aarch64-apple-darwin, ext: tar.gz }
           - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: zip }
     runs-on: ${{ matrix.os }}
     steps:
@@ -64,7 +64,7 @@ jobs:
         include:
           - { os: ubuntu-latest, target: x86_64, manylinux: auto }
           - { os: ubuntu-24.04-arm, target: aarch64, manylinux: auto }
-          - { os: macos-14, target: aarch64, manylinux: "" }
+          - { os: macos-15, target: aarch64, manylinux: "" }
           - { os: windows-latest, target: x64, manylinux: "" }
     runs-on: ${{ matrix.os }}
     steps:
