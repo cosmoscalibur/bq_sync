@@ -5,6 +5,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-06
+
 ### Added
 
 - `push` creates a scheduled query that does not exist in BigQuery from the
