@@ -12,7 +12,7 @@ env:
 
 jobs:
   check-version:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@v4
       - name: Tag matches Cargo.toml version
@@ -29,9 +29,9 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, ext: tar.gz }
+          - { os: ubuntu-slim, target: x86_64-unknown-linux-gnu, ext: tar.gz }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, ext: tar.gz }
-          - { os: macos-15, target: aarch64-apple-darwin, ext: tar.gz }
+          - { os: macos-latest, target: aarch64-apple-darwin, ext: tar.gz }
           - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: zip }
     runs-on: ${{ matrix.os }}
     steps:
@@ -62,9 +62,9 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64, manylinux: auto }
+          - { os: ubuntu-slim, target: x86_64, manylinux: auto }
           - { os: ubuntu-24.04-arm, target: aarch64, manylinux: auto }
-          - { os: macos-15, target: aarch64, manylinux: "" }
+          - { os: macos-latest, target: aarch64, manylinux: "" }
           - { os: windows-latest, target: x64, manylinux: "" }
     runs-on: ${{ matrix.os }}
     steps:
@@ -82,7 +82,7 @@ jobs:
 
   sdist:
     needs: check-version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@v4
       - uses: PyO3/maturin-action@v1
@@ -96,7 +96,7 @@ jobs:
 
   publish:
     needs: [binary, wheel, sdist]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
