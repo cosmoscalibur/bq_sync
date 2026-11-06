@@ -5,6 +5,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- `push` creates a scheduled query that does not exist in BigQuery from the
+  `-- Scheduled Query:` / `-- Schedule:` headers and the SQL body (no
+  destination dataset, so DDL/DML scripts). Previously it was skipped with
+  a warning. Existing queries keep the SQL-only update.
+
 ## [0.3.1] - 2026-11-06
 
 ### Added

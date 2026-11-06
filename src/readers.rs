@@ -39,6 +39,9 @@ pub struct SavedQueryUpdate {
 pub struct ScheduledQueryUpdate {
     pub name: String,
     pub sql: String,
+    /// ``-- Schedule:`` header value, if present.  Used only to create a
+    /// missing scheduled query; updates never push it.
+    pub schedule: Option<String>,
 }
 
 /// Mutable fields for a routine update (SQL or JavaScript).
@@ -117,8 +120,9 @@ fn parse_saved_query_text(text: &str, fallback_name: String) -> SavedQueryUpdate
 }
 
 /// Parse a scheduled-query ``.sql`` file, stripping its
-/// ``-- Scheduled Query`` / ``-- Schedule`` headers.  The schedule is not
-/// returned: it is managed by ``reschedule``.
+/// ``-- Scheduled Query`` / ``-- Schedule`` headers.  The schedule of an
+/// existing query is managed by ``reschedule``; it is returned only so a
+/// missing query can be created.
 pub fn read_scheduled_query_sql(path: &Path) -> Result<ScheduledQueryUpdate> {
     let text = read_text(path)?;
     Ok(parse_scheduled_query_text(&text, file_stem(path)))
@@ -127,6 +131,7 @@ pub fn read_scheduled_query_sql(path: &Path) -> Result<ScheduledQueryUpdate> {
 fn parse_scheduled_query_text(text: &str, fallback_name: String) -> ScheduledQueryUpdate {
     let lines = split_lines_keepends(text);
     let mut name = fallback_name;
+    let mut schedule = None;
     let mut body_start = 0;
     for (idx, line) in lines.iter().enumerate() {
         let stripped = strip_eol(line);
@@ -135,7 +140,8 @@ fn parse_scheduled_query_text(text: &str, fallback_name: String) -> ScheduledQue
             body_start = idx + 1;
             continue;
         }
-        if SCHEDULED_QUERY_SCHEDULE_RE.is_match(stripped) {
+        if let Some(m) = SCHEDULED_QUERY_SCHEDULE_RE.captures(stripped) {
+            schedule = Some(m[1].trim().to_owned());
             body_start = idx + 1;
             continue;
         }
@@ -149,6 +155,7 @@ fn parse_scheduled_query_text(text: &str, fallback_name: String) -> ScheduledQue
     ScheduledQueryUpdate {
         name,
         sql: lines[body_start..].concat(),
+        schedule,
     }
 }
 
