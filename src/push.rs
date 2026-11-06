@@ -894,13 +894,15 @@ mod tests {
         };
         let paths = [&sq, &missing].map(|p| p.to_string_lossy().into_owned());
         push_manual(&api, &config(), &cfg, &paths, None, &opts).unwrap();
-        // The existing query gets its SQL updated (schedule header not
-        // pushed); the missing one is created from its headers.
+        // The existing query gets its SQL and (changed) schedule updated;
+        // the missing one is created from its headers.
         assert_eq!(
             api.calls(),
             vec![
                 "update_query projects/my-project/locations/us-east1/transferConfigs/7 \
                  CREATE OR REPLACE TABLE `p.d.t` AS SELECT 1\n",
+                "update_schedule projects/my-project/locations/us-east1/transferConfigs/7 \
+                 every 24 hours",
                 "create_transfer gone | every 24 hours | SELECT 1\n"
             ]
         );

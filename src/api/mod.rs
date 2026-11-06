@@ -123,8 +123,9 @@ pub trait BqApi {
     /// Update the SQL of the scheduled query named *display_name*, or create
     /// it from *schedule* and *sql* when it does not exist.
     ///
-    /// Only the SQL of an existing query is pushed (schedule changes go
-    /// through `reschedule`). A created query has no destination dataset,
+    /// An existing query gets its SQL and, when the file has a different
+    /// `-- Schedule:` header, its schedule updated (like `reschedule
+    /// --from-file`). A created query has no destination dataset,
     /// so it must be a DDL/DML script; a missing `-- Schedule:` header is an
     /// error.
     fn upsert_scheduled_query_sql(
@@ -148,6 +149,10 @@ pub trait BqApi {
         };
         self.update_transfer_config_query(project, &tc.name, sql)?;
         log::info!("Updated SQL for scheduled query '{display_name}'.");
+        if let Some(schedule) = schedule.filter(|s| *s != tc.schedule) {
+            self.update_transfer_config_schedule(project, &tc.name, schedule)?;
+            log::info!("Updated schedule for '{display_name}' to '{schedule}'.");
+        }
         Ok(())
     }
 
