@@ -102,7 +102,7 @@ offline unless `--online` is given).
 
 ```text
 bq-sync [--version] [-v]
-bq-sync pull        [--dataset DATASET] [--dry-run] [--config PATH] [--force] [--force-file FILE]
+bq-sync pull        [--dataset DATASET] [--dry-run] [--config PATH] [--force] [--force-file FILE] [--refresh-metadata]
 bq-sync fetch       <project/dataset/model> [-f csv|parquet] [-o DIR] [--config PATH]
 bq-sync push        [FILE ...] [--data SOURCE DEST] [--since HOURS] [--dry-run] [--yes] [--include-models] [--config PATH]
 bq-sync rm          <path>... [--dry-run] [--yes] [--config PATH]
@@ -120,6 +120,7 @@ bq-sync reschedule  [DISPLAY_NAME] [--schedule S | --from-file] [--dry-run] [--t
 | `--dry-run` | Preview actions without writing files |
 | `--force` | Force fetch all files, bypassing decision matrix |
 | `--force-file FILE` | Force fetch a specific file (repeatable) |
+| `--refresh-metadata` | Also rewrite `row_count`, `created`, `modified` and `total_logical_bytes` in models with no other change (by default they are kept to avoid metadata-only diffs) |
 | `-v`, `--verbose` | Enable DEBUG logging |
 
 The resources of a dataset and the project-level queries are listed

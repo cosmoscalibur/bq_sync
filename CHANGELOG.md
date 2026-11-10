@@ -5,6 +5,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-11-10
+
+### Added
+
+- `ci.yml` workflow: `cargo fmt --check`, `cargo clippy -D warnings`,
+  `cargo test` and the Python binding tests on pull requests and pushes to
+  `main` (#19).
+- `pull --refresh-metadata` (`refresh_metadata` in the Python binding) to
+  rewrite the volatile model metadata on demand (#21).
+
+### Changed
+
+- `pull` no longer rewrites a model YAML whose only differences are the
+  volatile metadata (`row_count`, `created`, `modified`,
+  `total_logical_bytes`), avoiding metadata-only diffs (#21).
+- Commits made in BigQuery use the active `gcloud` account as author email;
+  the git email is only a fallback (#24).
+
+### Fixed
+
+- `pull` creates the model YAML of a view or routine whose local SQL is
+  already up to date, e.g. one created by `push` (#22).
+- `rm` of a saved query deletes the repository's workspaces first, instead
+  of failing with HTTP 400 (#23).
+
 ## [0.3.2] - 2026-11-06
 
 ### Added
