@@ -99,6 +99,7 @@ def pull(
     dry_run: bool = False,
     force: bool = False,
     force_files: list[str] | None = None,
+    refresh_metadata: bool = False,
 ) -> Path: ...
 def push(
     paths: list[str] | None = None,

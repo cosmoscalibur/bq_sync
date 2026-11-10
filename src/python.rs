@@ -288,7 +288,7 @@ fn check<'py>(
 
 /// Pull BigQuery resources; returns the project output directory.
 #[pyfunction]
-#[pyo3(signature = (config=None, dataset=None, dry_run=false, force=false, force_files=None))]
+#[pyo3(signature = (config=None, dataset=None, dry_run=false, force=false, force_files=None, refresh_metadata=false))]
 fn pull(
     py: Python<'_>,
     config: Option<PathBuf>,
@@ -296,6 +296,7 @@ fn pull(
     dry_run: bool,
     force: bool,
     force_files: Option<Vec<String>>,
+    refresh_metadata: bool,
 ) -> PyRes<PathBuf> {
     py.detach(move || {
         let (path, mut cfg) = cli::resolve_config(&config_arg(config))?;
@@ -306,6 +307,7 @@ fn pull(
             dry_run,
             force,
             force_files,
+            refresh_metadata,
         };
         crate::pull::pull_project(&GcpClient::new()?, &cfg, &path, &opts)
     })

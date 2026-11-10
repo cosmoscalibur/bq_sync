@@ -22,6 +22,25 @@ pub struct PullOptions {
     pub force: bool,
     /// When set, ``force`` only applies to these files (path or file name).
     pub force_files: Option<Vec<String>>,
+    /// Rewrite the volatile model metadata (``row_count``, ``created``,
+    /// ``modified``, ``total_logical_bytes``) even when nothing else changed.
+    pub refresh_metadata: bool,
+}
+
+/// Model YAML keys that describe a point-in-time state of the resource.
+const VOLATILE_KEYS: [&str; 4] = [
+    "row_count:",
+    "created:",
+    "modified:",
+    "total_logical_bytes:",
+];
+
+/// *content* without its volatile metadata lines.
+fn without_volatile(content: &str) -> Vec<&str> {
+    content
+        .lines()
+        .filter(|l| !VOLATILE_KEYS.iter().any(|k| l.starts_with(k)))
+        .collect()
 }
 
 impl PullOptions {
@@ -58,6 +77,35 @@ impl PullOptions {
     }
 }
 
+/// Run *write* on the model file *path*.  Unless ``refresh_metadata`` is set,
+/// an existing model whose only differences are volatile metadata keeps its
+/// previous content, so a pull does not produce metadata-only diffs.
+fn write_model(path: &Path, opts: &PullOptions, write: impl FnOnce() -> Result<()>) -> Result<()> {
+    let previous = if opts.refresh_metadata {
+        None
+    } else {
+        std::fs::read_to_string(path).ok()
+    };
+    write()?;
+    if let Some(previous) = previous
+        && let Ok(current) = std::fs::read_to_string(path)
+        && without_volatile(&previous) == without_volatile(&current)
+    {
+        std::fs::write(path, previous).map_err(|e| Error::io(path, e))?;
+    }
+    Ok(())
+}
+
+/// Whether the model *path* is missing and must be created even though its
+/// companion SQL file is up to date.
+fn model_missing(kind: &str, name: &str, path: &Path, opts: &PullOptions) -> bool {
+    if path.is_file() {
+        return false;
+    }
+    log::info!("FETCH {kind} model {name} -> {}", path.display());
+    !opts.dry_run
+}
+
 /// Write the views, routines, tables and external tables of one dataset.
 fn write_dataset(
     output_root: &Path,
@@ -70,9 +118,14 @@ fn write_dataset(
 
     for view in &resources.views {
         let sql_path = ds_dir.join("views").join(format!("{}.sql", view.name));
+        let model_path = models(&view.name);
         if opts.should_fetch("view", &view.name, view.modified, &sql_path) {
             writers::write_view_sql(&sql_path, view)?;
-            writers::write_view_model_yaml(&models(&view.name), view)?;
+            write_model(&model_path, opts, || {
+                writers::write_view_model_yaml(&model_path, view)
+            })?;
+        } else if model_missing("view", &view.name, &model_path, opts) {
+            writers::write_view_model_yaml(&model_path, view)?;
         }
     }
 
@@ -80,23 +133,30 @@ fn write_dataset(
         let sql_path = ds_dir
             .join("routines")
             .join(format!("{}.sql", routine.name));
+        let model_path = models(&routine.name);
         if opts.should_fetch("routine", &routine.name, routine.modified, &sql_path) {
             writers::write_routine_sql(&sql_path, routine)?;
-            writers::write_routine_model_yaml(&models(&routine.name), routine)?;
+            write_model(&model_path, opts, || {
+                writers::write_routine_model_yaml(&model_path, routine)
+            })?;
+        } else if model_missing("routine", &routine.name, &model_path, opts) {
+            writers::write_routine_model_yaml(&model_path, routine)?;
         }
     }
 
     for table in &resources.tables {
         let path = models(&table.name);
         if opts.should_fetch("model", &table.name, table.modified, &path) {
-            writers::write_model_yaml(&path, table)?;
+            write_model(&path, opts, || writers::write_model_yaml(&path, table))?;
         }
     }
 
     for ext in &resources.externals {
         let path = models(&ext.name);
         if opts.should_fetch("external", &ext.name, ext.modified, &path) {
-            writers::write_external_definition(&path, ext)?;
+            write_model(&path, opts, || {
+                writers::write_external_definition(&path, ext)
+            })?;
         }
     }
     Ok(())
@@ -340,5 +400,54 @@ mod tests {
         };
         assert!(opts.is_forced(Path::new("/x/views/v.sql")));
         assert!(!opts.is_forced(Path::new("/x/views/w.sql")));
+    }
+
+    #[test]
+    fn model_created_for_view_with_up_to_date_sql() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("bq_sync.toml");
+        let root = resolve_output_dir(&config(), &cfg_path).join("ds");
+        std::fs::create_dir_all(root.join("views")).unwrap();
+        // Local SQL exists and is committed after the BQ modification time.
+        std::fs::write(root.join("views/v.sql"), "SELECT 1").unwrap();
+        crate::fetch::tests::git(dir.path(), &["init", "-q"]);
+        crate::fetch::tests::git(dir.path(), &["add", "-A"]);
+        crate::fetch::tests::git(dir.path(), &["commit", "-q", "-m", "x"]);
+        pull_project(&fake(), &config(), &cfg_path, &PullOptions::default()).unwrap();
+        assert!(root.join("models/v.yaml").is_file());
+    }
+
+    #[test]
+    fn volatile_metadata_only_changes_are_not_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.yaml");
+        let table = |rows: i64| TableInfo {
+            name: "t".into(),
+            row_count: rows,
+            modified: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
+            ..Default::default()
+        };
+        let opts = PullOptions::default();
+        write_model(&path, &opts, || writers::write_model_yaml(&path, &table(1))).unwrap();
+        write_model(&path, &opts, || writers::write_model_yaml(&path, &table(2))).unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("row_count: 1")
+        );
+
+        let refresh = PullOptions {
+            refresh_metadata: true,
+            ..Default::default()
+        };
+        write_model(&path, &refresh, || {
+            writers::write_model_yaml(&path, &table(3))
+        })
+        .unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("row_count: 3")
+        );
     }
 }

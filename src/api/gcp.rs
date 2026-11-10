@@ -795,6 +795,14 @@ impl GcpClient {
         })
     }
 
+    /// Names of every workspace of the repository *repo*.
+    async fn list_workspace_names(&self, project: &str, repo: &str) -> Result<Vec<String>> {
+        let client = self.dataform(project).await?;
+        let workspaces: Vec<df::Workspace> =
+            collect_items!(client.list_workspaces().set_parent(repo).by_item());
+        Ok(workspaces.into_iter().map(|w| w.name).collect())
+    }
+
     async fn read_saved_sql(&self, project: &str, workspace: &str) -> Result<String> {
         let resp = self
             .dataform(project)
@@ -1450,8 +1458,18 @@ impl BqApi for GcpClient {
                         "Saved query '{name}' not found in project '{project}' region '{region}'."
                     ))
                 })?;
-            self.dataform(project)
-                .await?
+            // The API refuses to delete a repository that still has workspaces.
+            let client = self.dataform(project).await?;
+            for workspace in self.list_workspace_names(project, &repo.name).await? {
+                log::info!("Deleting workspace {workspace}");
+                client
+                    .delete_workspace()
+                    .set_name(&workspace)
+                    .send()
+                    .await
+                    .map_err(gax_error)?;
+            }
+            client
                 .delete_repository()
                 .set_name(repo.name)
                 .set_force(true)
@@ -1586,21 +1604,18 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Commit author as ``(name, email)``: the git identity when configured,
-/// else the active gcloud account, with the tool appended to the name
+/// Commit author as ``(name, email)``.  The email is the active gcloud
+/// account, the identity that actually performs the change in GCP; the git
+/// email is only a fallback when gcloud reports none.  The name is the git
+/// name when configured, else the email, with the tool appended
 /// (``Jane Doe (bq-sync)``) so commits stay attributable to the user.
 fn author_identity(
     git_name: Option<String>,
-    git_email: Option<String>,
-    gcloud_account: impl FnOnce() -> Option<String>,
+    git_email: impl FnOnce() -> Option<String>,
+    gcloud_account: Option<String>,
 ) -> (String, String) {
-    let (name, email) = match (git_name, git_email) {
-        (Some(n), e) => (n, e.unwrap_or_default()),
-        (None, e) => match e.or_else(gcloud_account) {
-            Some(account) => (account.clone(), account),
-            None => (String::new(), String::new()),
-        },
-    };
+    let email = gcloud_account.or_else(git_email).unwrap_or_default();
+    let name = git_name.unwrap_or_else(|| email.clone());
     let name = if name.is_empty() {
         TOOL_NAME.to_owned()
     } else {
@@ -1613,8 +1628,8 @@ fn commit_author() -> df::CommitAuthor {
     static IDENTITY: LazyLock<(String, String)> = LazyLock::new(|| {
         author_identity(
             command_output("git", &["config", "user.name"]),
-            command_output("git", &["config", "user.email"]),
-            || command_output("gcloud", &["config", "get-value", "account", "--quiet"]),
+            || command_output("git", &["config", "user.email"]),
+            command_output("gcloud", &["config", "get-value", "account", "--quiet"]),
         )
     });
     df::CommitAuthor::new()
@@ -1821,22 +1836,22 @@ fn sql_type(name: &str) -> bq::StandardSqlDataType {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn author_identity_prefers_git_then_gcloud() {
+    fn author_identity_uses_gcloud_email() {
         use super::author_identity as id;
         let some = |s: &str| Some(s.to_owned());
         assert_eq!(
-            id(some("Edward Villegas"), some("e@x.co"), || some("g@x.co")),
-            ("Edward Villegas (bq-sync)".into(), "e@x.co".into())
+            id(some("Edward Villegas"), || some("e@x.co"), some("g@x.co")),
+            ("Edward Villegas (bq-sync)".into(), "g@x.co".into())
         );
         assert_eq!(
-            id(None, None, || some("g@x.co")),
+            id(None, || None, some("g@x.co")),
             ("g@x.co (bq-sync)".into(), "g@x.co".into())
         );
         assert_eq!(
-            id(None, some("e@x.co"), || None),
+            id(None, || some("e@x.co"), None),
             ("e@x.co (bq-sync)".into(), "e@x.co".into())
         );
-        assert_eq!(id(None, None, || None), ("bq-sync".into(), String::new()));
+        assert_eq!(id(None, || None, None), ("bq-sync".into(), String::new()));
     }
 
     use super::*;

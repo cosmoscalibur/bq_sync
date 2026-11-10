@@ -69,6 +69,10 @@ pub enum Command {
         /// Force fetch a specific file (repeatable).
         #[arg(long = "force-file", value_name = "FORCE_FILE")]
         force_file: Vec<String>,
+        /// Also refresh row_count, created, modified and total_logical_bytes
+        /// in model files that have no other change.
+        #[arg(long)]
+        refresh_metadata: bool,
     },
     /// Deploy local resources to BigQuery.
     Push {
@@ -227,6 +231,7 @@ pub fn execute(command: Command) -> Result<()> {
             dry_run,
             force,
             force_file,
+            refresh_metadata,
         } => {
             let (path, mut cfg) = resolve_config(&config)?;
             if let Some(ds) = dataset {
@@ -236,6 +241,7 @@ pub fn execute(command: Command) -> Result<()> {
                 dry_run,
                 force,
                 force_files: (!force_file.is_empty()).then_some(force_file),
+                refresh_metadata,
             };
             pull::pull_project(&client()?, &cfg, &path, &opts)?;
         }
